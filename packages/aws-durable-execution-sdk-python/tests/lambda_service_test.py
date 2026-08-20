@@ -1271,6 +1271,44 @@ def test_operation_from_dict_no_options():
     assert operation.operation_id == "test-id"
 
 
+def test_operation_from_dict_in_flight_distributed_map_details_parsed_without_status():
+    """In-flight DistributedMapDetails (no Status/CompletionReason) parses without raising, leaving both None."""
+    data = {
+        "Id": "dmap-id",
+        "Type": "DISTRIBUTED_MAP",
+        "Status": "STARTED",
+        "DistributedMapDetails": {
+            "TotalCount": 3,
+            "SuccessCount": 1,
+        },
+    }
+    operation = Operation.from_dict(data)
+    assert operation.distributed_map_details is not None
+    assert operation.distributed_map_details.status is None
+    assert operation.distributed_map_details.completion_reason is None
+    assert operation.distributed_map_details.total_count == 3
+    assert operation.distributed_map_details.success_count == 1
+
+
+def test_operation_from_dict_terminal_distributed_map_details_parsed():
+    """Terminal DistributedMapDetails parses into distributed_map_details."""
+    data = {
+        "Id": "dmap-id",
+        "Type": "DISTRIBUTED_MAP",
+        "Status": "SUCCEEDED",
+        "DistributedMapDetails": {
+            "Status": "SUCCEEDED",
+            "CompletionReason": "ALL_COMPLETED",
+            "TotalCount": 3,
+            "SuccessCount": 3,
+        },
+    }
+    operation = Operation.from_dict(data)
+    assert operation.distributed_map_details is not None
+    assert operation.distributed_map_details.status.value == "SUCCEEDED"
+    assert operation.distributed_map_details.completion_reason.value == "ALL_COMPLETED"
+
+
 def test_operation_from_dict_individual_options():
     """Test Operation.from_dict with each option type individually."""
     # Test with just ContextOptions
