@@ -49,6 +49,7 @@ class OperationType(Enum):
     WAIT = "WAIT"
     CALLBACK = "CALLBACK"
     CHAINED_INVOKE = "CHAINED_INVOKE"
+    DISTRIBUTED_MAP = "DISTRIBUTED_MAP"
 
 
 def _to_invocation_status(status: ServiceInvocationStatus) -> InvocationStatus:
@@ -191,6 +192,7 @@ class OperationChangeInfo:
 class UserFunctionOutcome(Enum):
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
+    INCOMPLETE = "INCOMPLETE"
 
     @classmethod
     def from_error(cls, error: ErrorObject | None) -> UserFunctionOutcome:
@@ -215,7 +217,11 @@ class UserFunctionEndInfo(OperationInfo):
 
     @classmethod
     def from_start_info(
-        cls, start_info: UserFunctionStartInfo, error: ErrorObject | None
+        cls,
+        start_info: UserFunctionStartInfo,
+        error: ErrorObject | None,
+        *,
+        outcome: UserFunctionOutcome | None = None,
     ) -> UserFunctionEndInfo:
         return UserFunctionEndInfo(
             operation_id=start_info.operation_id,
@@ -228,7 +234,11 @@ class UserFunctionEndInfo(OperationInfo):
             status=start_info.status,
             is_replay_children=start_info.is_replay_children,
             attempt=start_info.attempt,
-            outcome=UserFunctionOutcome.from_error(error),
+            outcome=(
+                outcome
+                if outcome is not None
+                else UserFunctionOutcome.from_error(error)
+            ),
             end_time=datetime.datetime.now(datetime.UTC),
             error=error,
         )
@@ -650,10 +660,17 @@ class PluginExecutor:
         self.execute_plugins(start_info, sync=True)
         return start_info
 
-    def on_user_function_end(self, start_info: UserFunctionStartInfo, error) -> None:
-        """Execute any registered plugins for the operation when its user function finishes execution."""
+    def on_user_function_end(
+        self,
+        start_info: UserFunctionStartInfo,
+        error,
+        *,
+        outcome: UserFunctionOutcome | None = None,
+    ) -> None:
+        """Execute plugins when a user function returns, fails, or is incomplete."""
         self.execute_plugins(
-            UserFunctionEndInfo.from_start_info(start_info, error), sync=True
+            UserFunctionEndInfo.from_start_info(start_info, error, outcome=outcome),
+            sync=True,
         )
 
     def on_operation_action(

@@ -3,11 +3,11 @@
 Drives the full plugin lifecycle against a real TracerProvider +
 InMemorySpanExporter for the two deployment shapes:
 
-* Community collector layer: the caller supplies a provider; the Workflow and
-  Invocation spans root separate traces when no ambient parent exists.
-* ADOT layer: the ADOT Lambda layer supplies the global provider and the ambient
-  Lambda invocation span; the plugin's Invocation span parents to that ambient
-  span.
+* Community collector layer: the caller supplies a provider.
+* ADOT layer: the ADOT Lambda layer supplies the global provider.
+
+Both paths keep Workflow and Invocation on one execution trace, parented to a
+shared execution ancestor.
 """
 
 from __future__ import annotations
@@ -33,16 +33,18 @@ from aws_durable_execution_sdk_python.plugin import (
 )
 from opentelemetry import trace
 from opentelemetry.context import Context
-from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import (
     ProxyTracerProvider,
+    SpanKind,
     TracerProvider as ApiTracerProvider,
 )
 
 from aws_durable_execution_sdk_python_otel.deterministic_id_generator import (
     DeterministicIdGenerator,
+    derive_execution_root_span_id,
     derive_workflow_span_id,
     operation_id_to_span_id,
 )
@@ -77,6 +79,33 @@ def _provider() -> tuple[TracerProvider, InMemorySpanExporter]:
     provider = TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     return provider, exporter
+
+
+class _AdotParentInspectionProcessor(SpanProcessor):
+    """Exercise the SDK-only parent fields accessed by the ADOT processor."""
+
+    def on_start(self, span, parent_context=None) -> None:
+        parent = trace.get_current_span(parent_context)
+        if not parent.get_span_context().is_valid:
+            return
+        if isinstance(parent, ReadableSpan):
+            _ = parent.attributes
+        else:
+            parent_kind = getattr(parent, "kind", None)
+            parent_attributes = getattr(parent, "attributes", {})
+            _ = parent_kind
+            _ = parent_attributes.get("aws.trace.id")
+        if getattr(parent, "kind", None) is SpanKind.SERVER:
+            _ = getattr(parent, "kind", None)
+
+    def on_end(self, span: ReadableSpan) -> None:
+        return
+
+    def shutdown(self) -> None:
+        return
+
+    def force_flush(self, timeout_millis: int = 30000) -> bool:
+        return True
 
 
 def _invocation_start() -> InvocationStartInfo:
@@ -171,7 +200,7 @@ def _config_for_provider(
         monkeypatch.setattr(trace, "get_tracer_provider", lambda: provider)
     return OtelPluginConfig(
         tracer_provider=None if uses_global_provider else provider,
-        context_extractor=lambda _: Context(),
+        context_extractor=lambda _: None,
         enrich_logger=False,
     )
 
@@ -225,7 +254,7 @@ def test_global_proxy_binds_sdk_provider_before_first_invocation(
     monkeypatch.setattr(trace, "get_tracer_provider", lambda: current_provider[0])
     plugin = ExecutionOtelPlugin(
         OtelPluginConfig(
-            context_extractor=lambda _: Context(),
+            context_extractor=lambda _: None,
             enrich_logger=False,
         )
     )
@@ -241,6 +270,32 @@ def test_global_proxy_binds_sdk_provider_before_first_invocation(
     }
 
 
+def test_parent_placeholder_supports_adot_style_parent_inspection() -> None:
+    """A vendor processor can inspect a deferred parent without an exception."""
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(_AdotParentInspectionProcessor())
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    plugin = ExecutionOtelPlugin(
+        OtelPluginConfig(
+            tracer_provider=provider,
+            context_extractor=lambda _: None,
+            enrich_logger=False,
+        )
+    )
+
+    plugin.on_invocation_start(_invocation_start())
+    _run_step_lifecycle(plugin)
+    plugin.on_invocation_end(_invocation_end())
+
+    assert {span.name for span in exporter.get_finished_spans()} == {
+        "Invocation",
+        "Workflow",
+        OP_NAME,
+        f"{OP_NAME} attempt 1",
+    }
+
+
 def test_global_proxy_disables_entire_invocation_until_sdk_provider_is_ready(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -250,7 +305,7 @@ def test_global_proxy_disables_entire_invocation_until_sdk_provider_is_ready(
     monkeypatch.setattr(trace, "get_tracer_provider", lambda: current_provider[0])
     plugin = ExecutionOtelPlugin(
         OtelPluginConfig(
-            context_extractor=lambda _: Context(),
+            context_extractor=lambda _: None,
             enrich_logger=False,
         )
     )
@@ -283,7 +338,7 @@ def test_community_layer_full_lifecycle_is_workflow_rooted():
     plugin = ExecutionOtelPlugin(
         OtelPluginConfig(
             tracer_provider=provider,
-            context_extractor=lambda _: Context(),
+            context_extractor=lambda _: None,
             enrich_logger=False,
         )
     )
@@ -299,17 +354,20 @@ def test_community_layer_full_lifecycle_is_workflow_rooted():
     operation = spans[OP_NAME]
     attempt = spans[f"{OP_NAME} attempt 1"]
 
-    # Workflow is the trace root with the deterministic workflow span id.
-    assert workflow.parent is None
+    # Workflow is parented to the synthetic execution ancestor with the
+    # deterministic workflow span id.
+    assert workflow.parent is not None
+    assert workflow.parent.span_id == derive_execution_root_span_id(EXECUTION_ARN)
     assert workflow.context.span_id == derive_workflow_span_id(EXECUTION_ARN)
     assert (
         workflow.attributes["durable.execution.status"]
         == InvocationStatus.SUCCEEDED.value
     )
 
-    # Without ambient context, Invocation roots a separate provider trace.
-    assert invocation.parent is None
-    assert invocation.context.trace_id != workflow.context.trace_id
+    # Without extracted context, Invocation shares the synthetic execution root.
+    assert invocation.parent is not None
+    assert invocation.context.trace_id == workflow.context.trace_id
+    assert invocation.parent.span_id == workflow.parent.span_id
 
     # Operation span: deterministic id, parented under Workflow, linked to invocation.
     assert operation.context.span_id == operation_id_to_span_id(EXECUTION_ARN, OP_ID)
@@ -328,13 +386,13 @@ def test_community_layer_full_lifecycle_is_workflow_rooted():
 # ---------------------------------------------------------------------------
 # ADOT layer (default provider; ambient invocation span)
 # ---------------------------------------------------------------------------
-def test_adot_layer_full_lifecycle_parents_to_ambient_span(monkeypatch):
+def test_adot_layer_full_lifecycle_ignores_different_trace_ambient_span(monkeypatch):
     provider, exporter = _provider()
     # Simulate the ADOT layer having configured the global TracerProvider.
     monkeypatch.setattr(trace, "get_tracer_provider", lambda: provider)
     plugin = ExecutionOtelPlugin(
         OtelPluginConfig(
-            context_extractor=lambda _: Context(),
+            context_extractor=lambda _: None,
             enrich_logger=False,
         )
     )
@@ -356,11 +414,14 @@ def test_adot_layer_full_lifecycle_parents_to_ambient_span(monkeypatch):
     invocation = spans["Invocation"]
     operation = spans[OP_NAME]
 
-    # Invocation span parents to the ambient ADOT span and carries the first flag.
+    # Invocation ignores the different-trace ambient ADOT span and stays on the
+    # execution trace.
     assert invocation.parent is not None
-    assert invocation.parent.span_id == ambient.get_span_context().span_id
-    assert invocation.context.trace_id == ambient.get_span_context().trace_id
-    assert workflow.context.trace_id != ambient.get_span_context().trace_id
+    assert workflow.parent is not None
+    assert invocation.parent.span_id != ambient.get_span_context().span_id
+    assert invocation.context.trace_id != ambient.get_span_context().trace_id
+    assert invocation.context.trace_id == workflow.context.trace_id
+    assert invocation.parent.span_id == workflow.parent.span_id
     assert invocation.attributes["durable.invocation.first"] is True
 
     # Operation span still uses the deterministic id and links to the durable
@@ -379,7 +440,7 @@ def test_second_plugin_uses_execution_trace_id_independent_of_xray(monkeypatch):
     provider, exporter = _provider()
     monkeypatch.setattr(trace, "get_tracer_provider", lambda: provider)
     config = OtelPluginConfig(
-        context_extractor=lambda _: Context(),
+        context_extractor=lambda _: None,
         enrich_logger=False,
     )
     first_plugin = ExecutionOtelPlugin(config)

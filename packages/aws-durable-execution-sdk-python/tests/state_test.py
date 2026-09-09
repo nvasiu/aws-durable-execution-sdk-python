@@ -18,8 +18,11 @@ from aws_durable_execution_sdk_python.exceptions import (
     CheckpointError,
     DurableApiErrorCategory,
     GetExecutionStateError,
+    NonDeterministicExecutionError,
     OrphanedChildException,
     StepError,
+    SuspendExecution,
+    TerminationReason,
     TimedSuspendExecution,
 )
 from aws_durable_execution_sdk_python.identifier import OperationIdentifier
@@ -45,6 +48,7 @@ from aws_durable_execution_sdk_python.plugin import (
     OperationStartInfo,
     PluginExecutor,
     UserFunctionEndInfo,
+    UserFunctionOutcome,
 )
 from aws_durable_execution_sdk_python.state import (
     CheckpointBatcherConfig,
@@ -610,6 +614,112 @@ def test_get_checkpoint_result_operation_not_found():
     assert result.is_succeeded() is False
     assert result.result is None
     assert result.operation is None
+
+
+@pytest.mark.parametrize(
+    ("checkpoint", "operation_identifier", "mismatch"),
+    [
+        (
+            Operation(
+                operation_id="op1",
+                operation_type=OperationType.WAIT,
+                status=OperationStatus.SUCCEEDED,
+                sub_type=OperationSubType.WAIT,
+                name="current-name",
+            ),
+            OperationIdentifier("op1", OperationSubType.STEP, name="current-name"),
+            "type",
+        ),
+        (
+            Operation(
+                operation_id="op1",
+                operation_type=OperationType.STEP,
+                status=OperationStatus.SUCCEEDED,
+                sub_type=OperationSubType.WAIT_FOR_CONDITION,
+                name="current-name",
+            ),
+            OperationIdentifier("op1", OperationSubType.STEP, name="current-name"),
+            "subtype",
+        ),
+        (
+            Operation(
+                operation_id="op1",
+                operation_type=OperationType.STEP,
+                status=OperationStatus.SUCCEEDED,
+                sub_type=OperationSubType.STEP,
+                name="checkpoint-name",
+            ),
+            OperationIdentifier("op1", OperationSubType.STEP, name="current-name"),
+            "name",
+        ),
+        (
+            Operation(
+                operation_id="op1",
+                operation_type=OperationType.STEP,
+                status=OperationStatus.SUCCEEDED,
+                parent_id="old-parent",
+                sub_type=OperationSubType.STEP,
+                name="current-name",
+            ),
+            OperationIdentifier(
+                "op1",
+                OperationSubType.STEP,
+                parent_id="current-parent",
+                name="current-name",
+            ),
+            "parent_id",
+        ),
+    ],
+)
+def test_operation_identifier_rejects_mismatched_checkpoint_identity(
+    checkpoint: Operation,
+    operation_identifier: OperationIdentifier,
+    mismatch: str,
+):
+    """Replay checkpoints must match the current operation before use."""
+    state = ExecutionState(
+        durable_execution_arn="test_arn",
+        initial_checkpoint_token="token123",  # noqa: S106
+        operations={"op1": checkpoint},
+        service_client=Mock(spec=LambdaClient),
+        plugin_executor=PluginExecutor(plugins=None),
+    )
+
+    with pytest.raises(NonDeterministicExecutionError, match=mismatch) as error_info:
+        operation_identifier.validate_checkpoint(
+            state.get_checkpoint_result(operation_identifier.operation_id).operation
+        )
+
+    assert error_info.value.step_id == "op1"
+    assert (
+        error_info.value.termination_reason
+        is TerminationReason.NON_DETERMINISTIC_EXECUTION
+    )
+
+
+def test_operation_identifier_normalizes_empty_name_to_wire_identity():
+    """An empty emitted name is omitted on the wire and replays as None."""
+    operation = Operation(
+        operation_id="op1",
+        operation_type=OperationType.STEP,
+        status=OperationStatus.SUCCEEDED,
+        sub_type=OperationSubType.STEP,
+        name=None,
+    )
+    state = ExecutionState(
+        durable_execution_arn="test_arn",
+        initial_checkpoint_token="token123",  # noqa: S106
+        operations={"op1": operation},
+        service_client=Mock(spec=LambdaClient),
+        plugin_executor=PluginExecutor(plugins=None),
+    )
+
+    result = state.get_checkpoint_result("op1")
+    OperationIdentifier("op1", OperationSubType.STEP, name="").validate_checkpoint(
+        result.operation
+    )
+
+    assert result.operation is operation
 
 
 def test_create_checkpoint():
@@ -1421,6 +1531,87 @@ def test_rejection_of_operations_from_completed_parents():
         state.create_checkpoint(child_checkpoint, is_sync=False)
 
     # Verify exception contains operation_id
+    assert exc_info.value.operation_id == "child_1"
+
+
+def test_parent_done_recheck_rejects_checkpoint_racing_parent_completion():
+    """A checkpoint that passed validation is rejected if its parent completes.
+
+    The child pauses in the operation hook after releasing _parent_done_lock and
+    before acquiring _completion_lock. Completing the parent during that pause
+    deterministically reproduces the validation-to-enqueue race without sleeps.
+    """
+    mock_lambda_client = Mock(spec=LambdaClient)
+    mock_plugin_executor = Mock(spec=PluginExecutor)
+    state = ExecutionState(
+        durable_execution_arn="test_arn",
+        initial_checkpoint_token="token123",  # noqa: S106
+        operations={},
+        service_client=mock_lambda_client,
+        plugin_executor=mock_plugin_executor,
+    )
+
+    child_reached_hook = threading.Event()
+    release_child_hook = threading.Event()
+
+    def block_child_completion(operation_update: OperationUpdate, **_: object) -> None:
+        if (
+            operation_update.operation_id == "child_1"
+            and operation_update.action == OperationAction.SUCCEED
+        ):
+            child_reached_hook.set()
+            assert release_child_hook.wait(timeout=2.0), (
+                "child checkpoint was not released"
+            )
+
+    mock_plugin_executor.on_operation_action.side_effect = block_child_completion
+
+    state.create_checkpoint(
+        OperationUpdate(
+            operation_id="parent_1",
+            operation_type=OperationType.CONTEXT,
+            action=OperationAction.START,
+        ),
+        is_sync=False,
+    )
+    state.create_checkpoint(
+        OperationUpdate(
+            operation_id="child_1",
+            operation_type=OperationType.CONTEXT,
+            action=OperationAction.START,
+            parent_id="parent_1",
+        ),
+        is_sync=False,
+    )
+    child_complete = OperationUpdate(
+        operation_id="child_1",
+        operation_type=OperationType.CONTEXT,
+        action=OperationAction.SUCCEED,
+        parent_id="parent_1",
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        child_future = executor.submit(state.create_checkpoint, child_complete, False)
+        assert child_reached_hook.wait(timeout=2.0), (
+            "child checkpoint did not reach the hook"
+        )
+
+        try:
+            state.create_checkpoint(
+                OperationUpdate(
+                    operation_id="parent_1",
+                    operation_type=OperationType.CONTEXT,
+                    action=OperationAction.SUCCEED,
+                ),
+                is_sync=False,
+            )
+            assert "child_1" in state._parent_done
+        finally:
+            release_child_hook.set()
+
+        with pytest.raises(OrphanedChildException) as exc_info:
+            child_future.result(timeout=2.0)
+
     assert exc_info.value.operation_id == "child_1"
 
 
@@ -4302,6 +4493,7 @@ class _RecordingPlugin(DurableInstrumentationPlugin):
     def __init__(self) -> None:
         self.calls: list[str] = []
         self.operation_starts: list[OperationStartInfo] = []
+        self.user_function_ends: list[UserFunctionEndInfo] = []
 
     def on_execution_start(self, info):
         self.calls.append("execution_start")
@@ -4332,6 +4524,7 @@ class _RecordingPlugin(DurableInstrumentationPlugin):
 
     def on_user_function_end(self, info):
         self.calls.append(f"user_function_end:{info.operation_id}")
+        self.user_function_ends.append(info)
 
 
 def test_execution_state_accepts_plugin_executor_parameter():
@@ -4821,15 +5014,12 @@ def test_plugin_executor_exception_does_not_break_checkpointing():
             executor.shutdown(wait=True)
 
 
-def test_wrap_user_function_suspend_does_not_fire_end_hook():
-    """A user function that suspends does not fire the end hook.
+def test_wrap_user_function_suspend_fires_incomplete_end_hook():
+    """A timed suspend reports an incomplete outcome through the end hook.
 
-    Regression: a timed suspend (TimedSuspendExecution) raised inside a wrapped
-    user function (e.g. a child context that waits) must not be surfaced to
-    plugins as a FAILED outcome. The suspend is normal durable control flow,
-    and the plugin observes it by absence (no end hook fires), with the
-    instrumentation plugin's own per-invocation span sweep closing any open
-    spans cleanly at invocation end.
+    Suspension is normal durable control flow rather than a user failure. The
+    callback still runs so plugins can release state bound to the user-function
+    thread, but it carries no error and must not be interpreted as completion.
     """
     captured: list[UserFunctionEndInfo] = []
 
@@ -4858,7 +5048,9 @@ def test_wrap_user_function_suspend_does_not_fire_end_hook():
         with pytest.raises(TimedSuspendExecution):
             wrapped(None)
 
-    assert captured == []
+    assert len(captured) == 1
+    assert captured[0].outcome is UserFunctionOutcome.INCOMPLETE
+    assert captured[0].error is None
 
 
 def test_plugin_executor_not_called_for_pending_operations():
@@ -5124,3 +5316,134 @@ def test_has_prior_operations_iteration_safe_under_concurrent_update():
     writer_t.join(timeout=5)
 
     assert not errors, f"has_prior_operations raced with concurrent update: {errors}"
+
+
+# region wrap_user_function incomplete notification
+
+
+def _wrapping_state(plugin: _RecordingPlugin) -> ExecutionState:
+    """Build an ExecutionState whose plugin executor is running."""
+    return ExecutionState(
+        durable_execution_arn="test_arn",
+        initial_checkpoint_token="token123",  # noqa: S106
+        operations={},
+        service_client=Mock(spec=LambdaClient),
+        plugin_executor=PluginExecutor(plugins=[plugin]),
+    )
+
+
+def _wrapped(state: ExecutionState, user_function):
+    return state.wrap_user_function(
+        user_function,
+        OperationIdentifier(
+            operation_id="step-1",
+            sub_type=OperationSubType.STEP,
+            name="fetch-user",
+        ),
+        attempt=1,
+    )
+
+
+@pytest.mark.parametrize(
+    "raised",
+    [
+        SuspendExecution("suspended"),
+        TimedSuspendExecution("suspended until", 1.0),
+        OrphanedChildException("parent already completed", "step-1"),
+        BackgroundThreadError("checkpoint failed", RuntimeError("boom")),
+        SystemExit(1),
+    ],
+)
+def test_wrap_user_function_reports_incomplete_when_no_outcome(raised):
+    """A user function that reports no outcome notifies plugins instead."""
+    plugin = _RecordingPlugin()
+    state = _wrapping_state(plugin)
+
+    def user_function():
+        raise raised
+
+    with state._plugin_executor.run(), pytest.raises(type(raised)):
+        _wrapped(state, user_function)()
+
+    assert plugin.calls == [
+        "user_function_start:step-1",
+        "user_function_end:step-1",
+    ]
+    assert [info.outcome for info in plugin.user_function_ends] == [
+        UserFunctionOutcome.INCOMPLETE
+    ]
+    assert plugin.user_function_ends[0].error is None
+
+
+def test_wrap_user_function_does_not_report_incomplete_on_success():
+    """A returning user function reports an end and nothing else."""
+    plugin = _RecordingPlugin()
+    state = _wrapping_state(plugin)
+
+    with state._plugin_executor.run():
+        assert _wrapped(state, lambda: "done")() == "done"
+
+    assert plugin.calls == [
+        "user_function_start:step-1",
+        "user_function_end:step-1",
+    ]
+    assert [info.outcome for info in plugin.user_function_ends] == [
+        UserFunctionOutcome.SUCCEEDED
+    ]
+
+
+def test_wrap_user_function_does_not_report_incomplete_on_failure():
+    """An ordinary exception reports an end, not an incomplete."""
+    plugin = _RecordingPlugin()
+    state = _wrapping_state(plugin)
+
+    def user_function():
+        raise ValueError("boom")
+
+    with state._plugin_executor.run(), pytest.raises(ValueError, match="boom"):
+        _wrapped(state, user_function)()
+
+    assert plugin.calls == [
+        "user_function_start:step-1",
+        "user_function_end:step-1",
+    ]
+    assert [info.outcome for info in plugin.user_function_ends] == [
+        UserFunctionOutcome.FAILED
+    ]
+
+
+def test_wrap_user_function_incomplete_runs_on_the_user_function_thread():
+    """The notification must arrive on the thread that ran the user function."""
+    hook_threads: list[int] = []
+
+    class _ThreadRecordingPlugin(DurableInstrumentationPlugin):
+        def on_user_function_end(self, info) -> None:
+            if info.outcome is UserFunctionOutcome.INCOMPLETE:
+                hook_threads.append(threading.get_ident())
+
+    plugin = _ThreadRecordingPlugin()
+    state = ExecutionState(
+        durable_execution_arn="test_arn",
+        initial_checkpoint_token="token123",  # noqa: S106
+        operations={},
+        service_client=Mock(spec=LambdaClient),
+        plugin_executor=PluginExecutor(plugins=[plugin]),
+    )
+
+    def user_function():
+        raise SuspendExecution("suspended")
+
+    worker_threads: list[int] = []
+
+    def run_on_worker() -> None:
+        worker_threads.append(threading.get_ident())
+        with contextlib.suppress(SuspendExecution):
+            _wrapped(state, user_function)()
+
+    with state._plugin_executor.run(), ThreadPoolExecutor(max_workers=1) as worker:
+        worker.submit(run_on_worker).result()
+
+    assert hook_threads == worker_threads
+
+
+# endregion

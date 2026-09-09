@@ -5,18 +5,35 @@ from __future__ import annotations
 import json
 import logging
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 from aws_durable_execution_sdk_python.exceptions import (
     ChildContextError,
+    DurableOperationError,
     InvalidStateError,
+    DistributedMapError,
+    register_operation_error,
 )
-from aws_durable_execution_sdk_python.lambda_service import ErrorObject
+from aws_durable_execution_sdk_python.config import (
+    BatchItemStatus,
+    CompletionDecision,
+    CompletionItemStatus,
+    CompletionOutcome,
+    CompletionStatus,
+)
+from aws_durable_execution_sdk_python.lambda_service import (
+    DistributedMapCompletionReason,
+    DistributedMapItemStatus,
+    DistributedMapStatus,
+    ErrorObject,
+)
 from aws_durable_execution_sdk_python.types import BatchResult as BatchResultProtocol
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from aws_durable_execution_sdk_python.config import CompletionConfig
     from aws_durable_execution_sdk_python.types import SummaryGenerator
 
@@ -30,16 +47,48 @@ ResultType = TypeVar("ResultType")
 
 
 # region Result models
-class BatchItemStatus(Enum):
-    SUCCEEDED = "SUCCEEDED"
-    FAILED = "FAILED"
-    STARTED = "STARTED"
 
 
 class CompletionReason(Enum):
     ALL_COMPLETED = "ALL_COMPLETED"
     MIN_SUCCESSFUL_REACHED = "MIN_SUCCESSFUL_REACHED"
     FAILURE_TOLERANCE_EXCEEDED = "FAILURE_TOLERANCE_EXCEEDED"
+    CUSTOM_COMPLETION_SUCCEEDED = "CUSTOM_COMPLETION_SUCCEEDED"
+    CUSTOM_COMPLETION_FAILED = "CUSTOM_COMPLETION_FAILED"
+
+
+class BatchCompletionError(DurableOperationError):
+    """Raised by BatchResult.throw_if_error when a map/parallel batch completed
+    as failed because a custom should_complete decision returned a FAILED
+    outcome (CUSTOM_COMPLETION_FAILED) - even when no individual item failed
+    (for example when a required quorum could not be met).
+    """
+
+    def __init__(
+        self,
+        completion_reason: CompletionReason = CompletionReason.CUSTOM_COMPLETION_FAILED,
+        message: str | None = None,
+        error_type: str | None = None,
+        data: str | None = None,
+        stack_trace: list[str] | None = None,
+    ) -> None:
+        super().__init__(
+            message
+            or f"Batch completed as failed by should_complete "
+            f"({completion_reason.value})",
+            error_type,
+            data,
+            stack_trace,
+        )
+        self.completion_reason: CompletionReason = completion_reason
+
+
+# Registered for replay reconstruction like the other operation errors. Its
+# module lives above exceptions.py in the import graph, so it registers itself
+# here rather than in the registry literal. completion_reason defaults to the
+# only reason it is raised for, so a reconstruction that omits it (the standard
+# error-field constructor) still yields a meaningful value.
+register_operation_error(BatchCompletionError)
 
 
 @dataclass(frozen=True)
@@ -48,8 +97,12 @@ class CompletionPolicy:
 
     Single home for the completion logic shared by the concurrency
     coordinator (scheduling decisions) and :class:`BatchResult`
-    (completion reason inference). A user-supplied completion predicate,
-    if introduced later, slots in here.
+    (completion reason inference).
+
+    When a custom predicate (``should_complete``) is provided it takes full
+    precedence: the threshold fields are ignored and the predicate alone
+    decides early completion. The batch still completes once every item
+    finishes regardless of the predicate's return value.
 
     Fail-fast semantics: when no criteria are configured at all, a single
     failure exceeds tolerance.
@@ -59,6 +112,7 @@ class CompletionPolicy:
     min_successful: int | None = None
     tolerated_failure_count: int | None = None
     tolerated_failure_percentage: int | float | None = None
+    should_complete: Callable[[CompletionStatus], CompletionDecision] | None = None
 
     @classmethod
     def from_config(
@@ -72,6 +126,7 @@ class CompletionPolicy:
             min_successful=config.min_successful,
             tolerated_failure_count=config.tolerated_failure_count,
             tolerated_failure_percentage=config.tolerated_failure_percentage,
+            should_complete=config.should_complete,
         )
 
     @property
@@ -83,8 +138,29 @@ class CompletionPolicy:
             or self.tolerated_failure_percentage is not None
         )
 
+    def _build_status(
+        self,
+        succeeded: int,
+        failed: int,
+        items: tuple[CompletionItemStatus, ...] = (),
+    ) -> CompletionStatus:
+        """Build a CompletionStatus snapshot from current counts."""
+        return CompletionStatus(
+            success_count=succeeded,
+            failure_count=failed,
+            completed_count=succeeded + failed,
+            total_count=self.total,
+            items=items,
+        )
+
     def is_tolerance_exceeded(self, failed: int) -> bool:
-        """True when failures exceed the configured tolerance."""
+        """True when failures exceed the configured tolerance.
+
+        When a custom predicate is active, tolerance checking is disabled -
+        the predicate owns all early-exit decisions.
+        """
+        if self.should_complete is not None:
+            return False
         if not self.has_criteria:
             return failed > 0
         if (
@@ -98,19 +174,72 @@ class CompletionPolicy:
         return False
 
     def should_continue(self, failed: int) -> bool:
-        """True while more branches may be scheduled."""
+        """True while more branches may be scheduled.
+
+        When a custom predicate is active, scheduling is never stopped by
+        tolerance - the predicate controls completion via is_complete.
+        """
         return not self.is_tolerance_exceeded(failed)
 
-    def is_complete(self, succeeded: int, failed: int) -> bool:
-        """True when the batch has met a completion criterion."""
+    def evaluate(
+        self,
+        succeeded: int,
+        failed: int,
+        items: tuple[CompletionItemStatus, ...] = (),
+    ) -> CompletionDecision | None:
+        """Evaluate the custom predicate once, or None when none is configured.
+
+        Callers pass the result to :meth:`is_complete` and :meth:`reason` so
+        the predicate runs at most once per state change.
+        """
+        if self.should_complete is None:
+            return None
+        status: CompletionStatus = self._build_status(succeeded, failed, items)
+        return self.should_complete(status)
+
+    def is_complete(
+        self,
+        succeeded: int,
+        failed: int,
+        items: tuple[CompletionItemStatus, ...] = (),
+        decision: CompletionDecision | None = None,
+    ) -> bool:
+        """True when the batch has met a completion criterion.
+
+        ``decision`` is the predicate result from :meth:`evaluate`; when None
+        and a predicate is configured it is evaluated here.
+        """
+        if self.should_complete is not None:
+            if decision is None:
+                decision = self.evaluate(succeeded, failed, items)
+            if decision is not None and decision.complete:
+                return True
         if succeeded + failed >= self.total:
             return True
         return self.min_successful is not None and succeeded >= self.min_successful
 
-    def reason(self, succeeded: int, failed: int) -> CompletionReason:
-        """Infer the completion reason. Tolerance is checked first."""
+    def reason(
+        self,
+        succeeded: int,
+        failed: int,
+        items: tuple[CompletionItemStatus, ...] = (),
+        decision: CompletionDecision | None = None,
+    ) -> CompletionReason:
+        """Infer the completion reason. Predicate is checked before all-completed.
+
+        ``decision`` is the predicate result from :meth:`evaluate`; when None
+        and a predicate is configured it is evaluated here.
+        """
         if self.is_tolerance_exceeded(failed):
             return CompletionReason.FAILURE_TOLERANCE_EXCEEDED
+        if self.should_complete is not None:
+            if decision is None:
+                decision = self.evaluate(succeeded, failed, items)
+            if decision is not None and decision.complete:
+                if decision.outcome is CompletionOutcome.FAILED:
+                    return CompletionReason.CUSTOM_COMPLETION_FAILED
+                return CompletionReason.CUSTOM_COMPLETION_SUCCEEDED
+            # Predicate did not fire — fall through to ALL_COMPLETED below.
         if succeeded + failed >= self.total:
             return CompletionReason.ALL_COMPLETED
         if self.min_successful is not None and succeeded >= self.min_successful:
@@ -346,7 +475,18 @@ class BatchResult(Generic[R], BatchResultProtocol[R]):  # noqa: PYI059
         policy: CompletionPolicy = CompletionPolicy.from_config(
             len(items), completion_config
         )
-        return cls(items, policy.reason(succeeded_count, failed_count))
+
+        # Build items snapshot so quorum predicates receive per-item state
+        # even in the fallback inference path.
+        item_snapshots: tuple[CompletionItemStatus, ...] = tuple(
+            CompletionItemStatus(
+                index=item.index,
+                status=item.status,
+            )
+            for item in items
+        )
+
+        return cls(items, policy.reason(succeeded_count, failed_count, item_snapshots))
 
     def to_dict(self) -> dict:
         return {
@@ -373,6 +513,10 @@ class BatchResult(Generic[R], BatchResultProtocol[R]):  # noqa: PYI059
 
     @property
     def status(self) -> BatchItemStatus:
+        if self.completion_reason is CompletionReason.CUSTOM_COMPLETION_FAILED:
+            return BatchItemStatus.FAILED
+        if self.completion_reason is CompletionReason.CUSTOM_COMPLETION_SUCCEEDED:
+            return BatchItemStatus.SUCCEEDED
         return BatchItemStatus.FAILED if self.has_failure else BatchItemStatus.SUCCEEDED
 
     @property
@@ -390,6 +534,9 @@ class BatchResult(Generic[R], BatchResultProtocol[R]):  # noqa: PYI059
             # typed form where possible, with __cause__ set). Remaining errors
             # stay in get_errors().
             first_error.raise_as_operation_error(ChildContextError)
+        if self.completion_reason is CompletionReason.CUSTOM_COMPLETION_FAILED:
+            # A custom decision marked the batch failed with no item error.
+            raise BatchCompletionError(self.completion_reason)
 
     def get_results(self) -> list[R]:
         return [
@@ -550,3 +697,126 @@ class BranchEvent(Generic[ResultType]):
 
 
 # endregion concurrency models
+
+
+# region map run result models
+@dataclass(frozen=True)
+class DistributedMapSummary:
+    """Outcome of a map run without per-item results.
+
+    Resolved by ``ctx.distributed_map`` for every terminal state. A non-``SUCCEEDED``
+    run resolves with this summary rather than raising. Use
+    :meth:`throw_if_error` to opt into raising.
+    """
+
+    status: DistributedMapStatus
+    completion_reason: DistributedMapCompletionReason
+    success_count: int
+    failure_count: int
+    unprocessed_count: int
+    distributed_map_run_arn: str | None = None
+    completion_details: str | None = None
+    total_count: int | None = None
+
+    @property
+    def distributed_map_id(self) -> str | None:
+        """Map-run id derived from the ARN, or ``None`` when the ARN is absent."""
+        if not self.distributed_map_run_arn:
+            return None
+        return self.distributed_map_run_arn.rsplit(":", 1)[-1]
+
+    @property
+    def has_failure(self) -> bool:
+        """``True`` when any item permanently failed."""
+        return self.failure_count > 0
+
+    def throw_if_error(self) -> None:
+        """Raise :class:`DistributedMapError` on any non-success outcome."""
+        if self.status is not DistributedMapStatus.SUCCEEDED:
+            detail = f", {self.completion_details}" if self.completion_details else ""
+            msg = (
+                f"Map run ended {self.status.value} "
+                f"(reason: {self.completion_reason.value}{detail})"
+            )
+            raise DistributedMapError(msg)
+        if self.failure_count > 0:
+            msg = (
+                f"Map run succeeded but {self.failure_count} item(s) permanently failed"
+            )
+            raise DistributedMapError(msg)
+
+
+@dataclass(frozen=True)
+class DistributedMapItemError:
+    """Error for a single failed map run item."""
+
+    error_type: str
+    error_message: str
+
+
+@dataclass(frozen=True)
+class DistributedMapResultItem:
+    """Outcome of a single map run item."""
+
+    item_id: str
+    status: DistributedMapItemStatus
+    output: Any | None = None
+    error: DistributedMapItemError | None = None
+
+
+@dataclass(frozen=True)
+class DistributedMapResult(DistributedMapSummary):
+    """Outcome of a map run with per-item results.
+
+    Resolved by ``ctx.distributed_map`` when inline result collection is enabled.
+    Extends :class:`DistributedMapSummary` with the retained per-item results.
+    """
+
+    all: list[DistributedMapResultItem] = field(default_factory=list)
+
+    def succeeded(self) -> list[DistributedMapResultItem]:
+        """Return the items that succeeded."""
+        return [
+            item
+            for item in self.all
+            if item.status is DistributedMapItemStatus.SUCCEEDED
+        ]
+
+    def failed(self) -> list[DistributedMapResultItem]:
+        """Return the items that permanently failed."""
+        return [
+            item for item in self.all if item.status is DistributedMapItemStatus.FAILED
+        ]
+
+    def get_results(self) -> list[Any]:
+        """Return the outputs of the succeeded items."""
+        return [
+            item.output
+            for item in self.all
+            if item.status is DistributedMapItemStatus.SUCCEEDED
+            and item.output is not None
+        ]
+
+    def get_errors(self) -> list[DistributedMapItemError]:
+        """Return the errors of the failed items."""
+        return [
+            item.error
+            for item in self.all
+            if item.status is DistributedMapItemStatus.FAILED and item.error is not None
+        ]
+
+    def throw_if_error(self) -> None:
+        """Raise the first failed item's error, otherwise defer to the summary rule."""
+        if self.status is DistributedMapStatus.SUCCEEDED and self.failure_count > 0:
+            failed = self.failed()
+            if failed:
+                first = failed[0]
+                if first.error is not None:
+                    msg = f"{first.error.error_type}: {first.error.error_message}"
+                    raise DistributedMapError(msg)
+                msg = f"item {first.item_id} failed"
+                raise DistributedMapError(msg)
+        super().throw_if_error()
+
+
+# endregion map run result models

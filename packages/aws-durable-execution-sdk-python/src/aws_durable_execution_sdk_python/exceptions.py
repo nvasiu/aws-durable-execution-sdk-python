@@ -265,8 +265,11 @@ class DurableOperationError(DurableExecutionsError):
 
     Wraps a failure that escaped a Durable Function operation (step, invoke,
     child context, wait_for_condition). The concrete class identifies the
-    operation kind (so callers can ``except StepError``); the escaping error is
-    preserved as ``__cause__`` on the first run and reconstructed on replay.
+    operation kind (so callers can ``except StepError``). ``__cause__`` holds a
+    ``DurableOperationError`` stand-in rebuilt from the checkpointed error
+    fields on both the first run and replay, for determinism; it does not hold
+    the original exception object. Inspect failures through ``error_type``,
+    ``message``, ``data``, and ``stack_trace``.
 
     Attributes:
         message: Human-readable failure message.
@@ -325,6 +328,10 @@ class StepError(DurableOperationError):
 
 class InvokeError(DurableOperationError):
     """Raised when a durable invoke operation fails."""
+
+
+class DistributedMapError(DurableOperationError):
+    """Raised when a durable map run operation fails."""
 
 
 class ChildContextError(DurableOperationError):
@@ -409,6 +416,18 @@ _DURABLE_OPERATION_ERROR_REGISTRY: dict[str, type[DurableOperationError]] = {
         CallbackSubmitterError,
     ]
 }
+
+
+def register_operation_error(error_cls: type[DurableOperationError]) -> None:
+    """Register an SDK-owned operation-error subclass for replay reconstruction.
+
+    For subclasses defined in higher-level modules that this module cannot
+    import without a cycle (e.g. BatchCompletionError). The class must accept
+    the standard error-field constructor keywords (message, error_type, data,
+    stack_trace) so from_error_fields can rebuild it.
+    """
+    key: str = f"{error_cls.__module__}.{error_cls.__qualname__}"
+    _DURABLE_OPERATION_ERROR_REGISTRY[key] = error_cls
 
 
 class StepInterruptedError(InvocationError):

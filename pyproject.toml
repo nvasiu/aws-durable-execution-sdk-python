@@ -30,10 +30,12 @@ examples-integration = "pytest --runner-mode=cloud -m example packages/aws-durab
 addopts = "-v --strict-markers --import-mode=importlib"
 testpaths = [
     "packages/aws-durable-execution-sdk-python/tests",
+    "packages/aws-durable-execution-sdk-python-insight/tests",
     "packages/aws-durable-execution-sdk-python-otel/tests",
     "packages/aws-durable-execution-sdk-python-testing/tests",
     "packages/aws-durable-execution-sdk-python-examples/test",
     "packages/aws-durable-execution-sdk-python-conformance-tests/tests",
+    "packages/aws-durable-execution-sdk-python-conformance-tests-otel/tests",
 ]
 markers = [
   # Used for test selection with -m example
@@ -127,7 +129,7 @@ test = "pytest packages/aws-durable-execution-sdk-python-examples/test {args}"
 
 [tool.hatch.envs.test-pypi-otel]
 dependencies = [
-  "aws-durable-execution-sdk-python>=1.8.0",
+  "aws-durable-execution-sdk-python>=2.0.0",
   "opentelemetry-sdk>=1.20.0",
   "opentelemetry-propagator-aws-xray",
   "pytest",
@@ -180,6 +182,7 @@ select = ["E4", "E7", "E9", "F", "TID252"]  # pycodestyle (E4/E7/E9) + Pyflakes 
 [tool.ruff.lint.isort]
 known-first-party = [
   "aws_durable_execution_sdk_python",
+  "aws_durable_execution_sdk_python_insight",
   "aws_durable_execution_sdk_python_otel",
   "aws_durable_execution_sdk_python_testing",
 ]

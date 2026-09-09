@@ -3,6 +3,8 @@
 import hashlib
 import json
 import random
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from itertools import islice
 from unittest.mock import ANY, MagicMock, Mock, patch
 
@@ -15,6 +17,8 @@ from aws_durable_execution_sdk_python.config import (
     Duration,
     InvokeConfig,
     MapConfig,
+    DistributedMapConfig,
+    DistributedMapProcessor,
     ParallelBranch,
     ParallelConfig,
     StepConfig,
@@ -32,6 +36,7 @@ from aws_durable_execution_sdk_python.exceptions import (
     CallbackTimeoutError,
     ChildContextError,
     InvokeError,
+    NonDeterministicExecutionError,
     StepError,
     SuspendExecution,
     ValidationError,
@@ -44,6 +49,7 @@ from aws_durable_execution_sdk_python.lambda_service import (
     OperationStatus,
     OperationSubType,
     OperationType,
+    StepDetails,
 )
 from aws_durable_execution_sdk_python.plugin import (
     DurableInstrumentationPlugin,
@@ -599,6 +605,74 @@ def test_step_increments_counter(mock_executor_class):
 
 
 @patch("aws_durable_execution_sdk_python.context.StepOperationExecutor")
+def test_shared_context_allocates_operation_ids_atomically(mock_executor_class):
+    """Concurrent callers cannot retain the same operation ID."""
+    mock_executor_class.return_value.process.return_value = "result"
+    mock_state = Mock(spec=ExecutionState)
+    mock_state.durable_execution_arn = (
+        "arn:aws:durable:us-east-1:123456789012:execution/test"
+    )
+    context = create_test_context(state=mock_state)
+    peek_barrier = threading.Barrier(2, timeout=5.0)
+    original_peek = context._peek_next_operation_id  # noqa: SLF001
+
+    def synchronized_peek() -> str:
+        operation_id = original_peek()
+        peek_barrier.wait()
+        return operation_id
+
+    context._peek_next_operation_id = synchronized_peek  # type: ignore[method-assign]  # noqa: SLF001
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(context.step, lambda _step_context: "unused")
+            for _ in range(2)
+        ]
+        assert [future.result(timeout=5.0) for future in futures] == [
+            "result",
+            "result",
+        ]
+
+    operation_ids = [
+        call.kwargs["operation_identifier"].operation_id
+        for call in mock_executor_class.call_args_list
+    ]
+    assert len(operation_ids) == 2
+    assert len(set(operation_ids)) == 2
+
+
+def test_operation_replay_aware_looks_up_allocated_operation_id():
+    """Replay lookup uses the atomically reserved ID instead of peeking again."""
+    mock_state = Mock(spec=ExecutionState)
+    mock_state.durable_execution_arn = (
+        "arn:aws:durable:us-east-1:123456789012:execution/test"
+    )
+    mock_state.get_checkpoint_result.return_value = (
+        CheckpointedResult.create_not_found()
+    )
+    context = DurableContext(
+        state=mock_state,
+        execution_context=ExecutionContext(
+            durable_execution_arn=mock_state.durable_execution_arn
+        ),
+        replay_status=ReplayStatus.REPLAY,
+    )
+    context._peek_next_checkpoint = Mock(  # type: ignore[method-assign]  # noqa: SLF001
+        side_effect=AssertionError("must look up the reserved operation ID")
+    )
+
+    with context._operation_replay_aware(  # noqa: SLF001
+        OperationSubType.STEP,
+        "current-step",
+    ) as operation_identifier:
+        assert context._step_counter.get_current() == 1  # noqa: SLF001
+
+    mock_state.get_checkpoint_result.assert_called_once_with(
+        operation_identifier.operation_id
+    )
+
+
+@patch("aws_durable_execution_sdk_python.context.StepOperationExecutor")
 def test_step_with_original_name(mock_executor_class):
     """Test step with callable that has _original_name attribute."""
     mock_executor = MagicMock()
@@ -1021,6 +1095,214 @@ def test_wait_with_time_less_than_one(mock_executor_class):
 # endregion wait
 
 
+# region distributed_map
+@pytest.mark.parametrize("max_concurrency", [0, -1])
+def test_map_run_rejects_non_positive_max_concurrency(max_concurrency: int):
+    """Test distributed_map raises ValidationError when max_concurrency is not positive."""
+    context = create_test_context()
+
+    with pytest.raises(
+        ValidationError, match="max_concurrency must be greater than zero"
+    ):
+        context.distributed_map(
+            ["a"],
+            DistributedMapProcessor.report_batch_outcome("test_processor"),
+            max_concurrency=max_concurrency,
+        )
+
+
+@pytest.mark.parametrize(
+    "source",
+    ["s3://bucket", b"bytes", bytearray(b"ba"), {"a": 1}, {"a", "b"}],
+)
+def test_distributed_map_rejects_non_list_source(source):
+    """Test distributed_map rejects sources that are not a DistributedMapSource or list/tuple."""
+    context = create_test_context()
+
+    with pytest.raises(ValidationError, match="list/tuple"):
+        context.distributed_map(
+            source,
+            DistributedMapProcessor.report_batch_outcome("test_processor"),
+            max_concurrency=1,
+        )
+
+
+@patch("aws_durable_execution_sdk_python.context.DistributedMapOperationExecutor")
+def test_distributed_map_basic(mock_executor_class):
+    """distributed_map builds a DISTRIBUTED_MAP executor and returns its process() result."""
+    mock_executor = MagicMock()
+    mock_executor.process.return_value = "map_summary"
+    mock_executor_class.return_value = mock_executor
+    mock_state = Mock(spec=ExecutionState)
+    mock_state.durable_execution_arn = (
+        "arn:aws:durable:us-east-1:123456789012:execution/test"
+    )
+    processor = DistributedMapProcessor.report_batch_outcome("test_processor")
+
+    context = create_test_context(state=mock_state)
+    expected_operation_id = next(operation_id_sequence())
+
+    result = context.distributed_map(["a", "b"], processor, max_concurrency=4)
+
+    assert result == "map_summary"
+    mock_executor_class.assert_called_once_with(
+        state=mock_state,
+        operation_identifier=OperationIdentifier(
+            expected_operation_id, OperationSubType.DISTRIBUTED_MAP, None, None
+        ),
+        source=["a", "b"],
+        processor=processor,
+        max_concurrency=4,
+        config=ANY,
+    )
+    mock_executor.process.assert_called_once()
+
+
+@patch("aws_durable_execution_sdk_python.context.DistributedMapOperationExecutor")
+def test_distributed_map_with_name_and_config(mock_executor_class):
+    """distributed_map forwards name into the identifier and passes the given config through."""
+    mock_executor = MagicMock()
+    mock_executor.process.return_value = "configured_summary"
+    mock_executor_class.return_value = mock_executor
+    mock_state = Mock(spec=ExecutionState)
+    mock_state.durable_execution_arn = (
+        "arn:aws:durable:us-east-1:123456789012:execution/test"
+    )
+    processor = DistributedMapProcessor.report_batch_outcome("test_processor")
+    config = DistributedMapConfig()
+
+    context = create_test_context(state=mock_state)
+    [context._create_step_id() for _ in range(5)]  # Set counter to 5 # noqa: SLF001
+
+    result = context.distributed_map(
+        ["a"], processor, max_concurrency=2, name="named_map", config=config
+    )
+
+    seq = operation_id_sequence()
+    [next(seq) for _ in range(5)]
+    expected_id = next(seq)
+
+    assert result == "configured_summary"
+    mock_executor_class.assert_called_once_with(
+        state=mock_state,
+        operation_identifier=OperationIdentifier(
+            expected_id, OperationSubType.DISTRIBUTED_MAP, None, "named_map"
+        ),
+        source=["a"],
+        processor=processor,
+        max_concurrency=2,
+        config=config,
+    )
+    mock_executor.process.assert_called_once()
+
+
+@patch("aws_durable_execution_sdk_python.context.DistributedMapOperationExecutor")
+def test_distributed_map_with_parent_id(mock_executor_class):
+    """distributed_map propagates the parent_id into the operation identifier."""
+    mock_executor = MagicMock()
+    mock_executor.process.return_value = "parent_summary"
+    mock_executor_class.return_value = mock_executor
+    mock_state = Mock(spec=ExecutionState)
+    mock_state.durable_execution_arn = (
+        "arn:aws:durable:us-east-1:123456789012:execution/test"
+    )
+    processor = DistributedMapProcessor.report_batch_outcome("test_processor")
+
+    context = create_test_context(state=mock_state, parent_id="parent123")
+    [context._create_step_id() for _ in range(2)]  # Set counter to 2 # noqa: SLF001
+
+    context.distributed_map(["a"], processor, max_concurrency=1)
+
+    seq = operation_id_sequence("parent123")
+    [next(seq) for _ in range(2)]
+    expected_id = next(seq)
+
+    mock_executor_class.assert_called_once_with(
+        state=mock_state,
+        operation_identifier=OperationIdentifier(
+            expected_id, OperationSubType.DISTRIBUTED_MAP, "parent123", None
+        ),
+        source=["a"],
+        processor=processor,
+        max_concurrency=1,
+        config=ANY,
+    )
+    mock_executor.process.assert_called_once()
+
+
+@patch("aws_durable_execution_sdk_python.context.DistributedMapOperationExecutor")
+def test_distributed_map_increments_counter(mock_executor_class):
+    """distributed_map increments the step counter once per call."""
+    mock_executor = MagicMock()
+    mock_executor.process.return_value = "result"
+    mock_executor_class.return_value = mock_executor
+    mock_state = Mock(spec=ExecutionState)
+    mock_state.durable_execution_arn = (
+        "arn:aws:durable:us-east-1:123456789012:execution/test"
+    )
+    processor = DistributedMapProcessor.report_batch_outcome("test_processor")
+
+    context = create_test_context(state=mock_state)
+    [context._create_step_id() for _ in range(10)]  # Set counter to 10 # noqa: SLF001
+
+    context.distributed_map(["a"], processor, max_concurrency=1)
+    context.distributed_map(["b"], processor, max_concurrency=1)
+
+    seq = operation_id_sequence()
+    [next(seq) for _ in range(10)]
+    expected_id1 = next(seq)
+    expected_id2 = next(seq)
+
+    assert context._step_counter.get_current() == 12  # noqa: SLF001
+    assert mock_executor_class.call_args_list[0][1][
+        "operation_identifier"
+    ] == OperationIdentifier(expected_id1, OperationSubType.DISTRIBUTED_MAP, None, None)
+    assert mock_executor_class.call_args_list[1][1][
+        "operation_identifier"
+    ] == OperationIdentifier(expected_id2, OperationSubType.DISTRIBUTED_MAP, None, None)
+
+
+@patch("aws_durable_execution_sdk_python.context.DistributedMapOperationExecutor")
+def test_distributed_map_defaults_config_when_none(mock_executor_class):
+    """distributed_map builds a default DistributedMapConfig when none is given."""
+    mock_executor = MagicMock()
+    mock_executor.process.return_value = "summary"
+    mock_executor_class.return_value = mock_executor
+    mock_state = Mock(spec=ExecutionState)
+    mock_state.durable_execution_arn = (
+        "arn:aws:durable:us-east-1:123456789012:execution/test"
+    )
+    processor = DistributedMapProcessor.report_batch_outcome("test_processor")
+
+    context = create_test_context(state=mock_state)
+    context.distributed_map(["a"], processor, max_concurrency=1)
+
+    passed_config = mock_executor_class.call_args[1]["config"]
+    assert isinstance(passed_config, DistributedMapConfig)
+
+
+@patch("aws_durable_execution_sdk_python.context.DistributedMapOperationExecutor")
+def test_distributed_map_returns_process_result(mock_executor_class):
+    """distributed_map returns whatever executor.process() returns (summary or result)."""
+    mock_executor = MagicMock()
+    sentinel = object()
+    mock_executor.process.return_value = sentinel
+    mock_executor_class.return_value = mock_executor
+    mock_state = Mock(spec=ExecutionState)
+    mock_state.durable_execution_arn = (
+        "arn:aws:durable:us-east-1:123456789012:execution/test"
+    )
+    processor = DistributedMapProcessor.report_batch_outcome("test_processor")
+
+    context = create_test_context(state=mock_state)
+    result = context.distributed_map(["a"], processor, max_concurrency=1)
+
+    assert result is sentinel
+
+
+# endregion distributed_map
+
+
 # region run_in_child_context
 @patch("aws_durable_execution_sdk_python.context.child_handler")
 def test_run_in_child_context_basic(mock_handler):
@@ -1048,7 +1330,11 @@ def test_run_in_child_context_basic(mock_handler):
     call_args = mock_handler.call_args
     assert call_args[1]["state"] is mock_state
     assert call_args[1]["operation_identifier"] == OperationIdentifier(
-        expected_operation_id, OperationSubType.RUN_IN_CHILD_CONTEXT, None, None
+        expected_operation_id,
+        OperationSubType.RUN_IN_CHILD_CONTEXT,
+        None,
+        None,
+        operation_type=OperationType.CONTEXT,
     )
     assert call_args[1]["config"] is None
 
@@ -1064,7 +1350,7 @@ def test_run_in_child_context_with_name_and_config(mock_handler):
     mock_callable = Mock()
     mock_callable._original_name = "original_function"  # noqa: SLF001
 
-    config = ChildConfig()
+    config = ChildConfig(sub_type=OperationSubType.STEP)
 
     context = create_test_context(state=mock_state)
     [context._create_step_id() for _ in range(3)]  # Set counter to 3 # noqa: SLF001
@@ -1078,7 +1364,11 @@ def test_run_in_child_context_with_name_and_config(mock_handler):
     assert result == "configured_child_result"
     call_args = mock_handler.call_args
     assert call_args[1]["operation_identifier"] == OperationIdentifier(
-        expected_id, OperationSubType.RUN_IN_CHILD_CONTEXT, None, "original_function"
+        expected_id,
+        OperationSubType.STEP,
+        None,
+        "original_function",
+        operation_type=OperationType.CONTEXT,
     )
     assert call_args[1]["config"] is config
 
@@ -1111,7 +1401,11 @@ def test_run_in_child_context_with_parent_id(mock_executor_class):
 
     call_args = mock_executor_class.call_args
     assert call_args[1]["operation_identifier"] == OperationIdentifier(
-        expected_id, OperationSubType.RUN_IN_CHILD_CONTEXT, "parent456", None
+        expected_id,
+        OperationSubType.RUN_IN_CHILD_CONTEXT,
+        "parent456",
+        None,
+        operation_type=OperationType.CONTEXT,
     )
 
 
@@ -1176,12 +1470,20 @@ def test_run_in_child_context_increments_counter(mock_executor_class):
     assert mock_executor_class.call_args_list[0][1][
         "operation_identifier"
     ] == OperationIdentifier(
-        expected_id1, OperationSubType.RUN_IN_CHILD_CONTEXT, None, None
+        expected_id1,
+        OperationSubType.RUN_IN_CHILD_CONTEXT,
+        None,
+        None,
+        operation_type=OperationType.CONTEXT,
     )
     assert mock_executor_class.call_args_list[1][1][
         "operation_identifier"
     ] == OperationIdentifier(
-        expected_id2, OperationSubType.RUN_IN_CHILD_CONTEXT, None, None
+        expected_id2,
+        OperationSubType.RUN_IN_CHILD_CONTEXT,
+        None,
+        None,
+        operation_type=OperationType.CONTEXT,
     )
 
 
@@ -2380,6 +2682,36 @@ def test_should_propagate_outer_parent_id_when_virtual_is_nested_in_virtual():
     assert inner_branch._create_step_id_for_logical_step(1) == expected
 
 
+def test_flat_branch_rejects_nested_inner_checkpoint_parent():
+    """Changing NESTED to FLAT keeps the inner id but changes its parent."""
+    branch_id = "branch-op"
+    inner_id = hashlib.blake2b(f"{branch_id}-1".encode()).hexdigest()[:64]
+    checkpoint = Operation(
+        operation_id=inner_id,
+        operation_type=OperationType.STEP,
+        status=OperationStatus.SUCCEEDED,
+        parent_id=branch_id,
+        sub_type=OperationSubType.STEP,
+        name="inner-step",
+        step_details=StepDetails(result=json.dumps("cached")),
+    )
+    state = _replay_state({inner_id: checkpoint})
+    executor_context = DurableContext(
+        state=state,
+        execution_context=ExecutionContext(
+            durable_execution_arn=state.durable_execution_arn
+        ),
+        parent_id="parallel-op",
+        replay_status=ReplayStatus.REPLAY,
+    )
+    flat_branch = executor_context.create_child_context(branch_id, is_virtual=True)
+
+    with pytest.raises(NonDeterministicExecutionError, match="parent_id"):
+        flat_branch.step(lambda _ctx: "must-not-run", name="inner-step")
+
+    state.close()
+
+
 # endregion Virtual-context identity tests
 
 
@@ -2869,6 +3201,64 @@ def test_replay_aware_does_not_emit_replay_hook_when_not_replaying():
         ctx._create_step_id()  # noqa: SLF001
 
     assert emitted == []
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_status", "updated"),
+    [
+        (OperationStatus.STARTED, False),
+        (OperationStatus.SUCCEEDED, True),
+    ],
+)
+def test_operation_identity_is_validated_before_replay_hooks(
+    checkpoint_status: OperationStatus,
+    updated: bool,
+):
+    """Mismatched history fails before replay/update plugin hooks are dispatched."""
+    captured: list[str] = []
+
+    class _CapturingPlugin(DurableInstrumentationPlugin):
+        def on_operation_start(self, info):
+            captured.append(f"start:{info.operation_id}")
+
+        def on_operation_end(self, info):
+            captured.append(f"end:{info.operation_id}")
+
+    plugin_executor = PluginExecutor(plugins=[_CapturingPlugin()])
+    step_body_calls: list[bool] = []
+    with plugin_executor.run():
+        state = ExecutionState(
+            durable_execution_arn="arn",
+            initial_checkpoint_token="token",  # noqa: S106
+            operations={},
+            service_client=Mock(),
+            plugin_executor=plugin_executor,
+            updated_operation_ids=[],
+        )
+        ctx = DurableContext(
+            state=state,
+            execution_context=ExecutionContext(durable_execution_arn="arn"),
+            replay_status=ReplayStatus.REPLAY,
+        )
+        next_id = ctx._peek_next_operation_id()  # noqa: SLF001
+        state._operations[next_id] = Operation(  # noqa: SLF001
+            operation_id=next_id,
+            operation_type=OperationType.WAIT,
+            status=checkpoint_status,
+            sub_type=OperationSubType.WAIT,
+            name="stale-wait",
+        )
+        if updated:
+            state._updated_operation_ids.add(next_id)  # noqa: SLF001
+
+        with pytest.raises(NonDeterministicExecutionError):
+            ctx.step(
+                lambda _step_context: step_body_calls.append(True),
+                name="current-step",
+            )
+
+    assert captured == []
+    assert step_body_calls == []
 
 
 def test_replay_aware_emits_update_hook_for_operation_updated_since_last_invocation():
