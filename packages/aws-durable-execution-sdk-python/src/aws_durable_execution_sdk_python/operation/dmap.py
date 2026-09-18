@@ -6,7 +6,7 @@ import json
 import logging
 from typing import TYPE_CHECKING, Any
 
-from aws_durable_execution_sdk_python.concurrency.models import (
+from aws_durable_execution_sdk_python.dmap.models import (
     DistributedMapItemError,
     DistributedMapResult,
     DistributedMapResultItem,
@@ -14,21 +14,37 @@ from aws_durable_execution_sdk_python.concurrency.models import (
 )
 from aws_durable_execution_sdk_python.config import (
     DistributedMapProcessor,
+    DistributedMapResultConfig,
     DistributedMapSource,
+    DistributedMapSourceFormat,
+    DistributedMapStatus,
+    ProcessorResponseMode,
 )
 from aws_durable_execution_sdk_python.exceptions import (
-    DistributedMapError,
     ExecutionError,
     ValidationError,
 )
 from aws_durable_execution_sdk_python.lambda_service import (
+    DistributedMapCompletionConfig,
+    DistributedMapCsvFormatOptions,
+    DistributedMapCsvHeaderLocation,
+    DistributedMapInlineSourceConfig,
+    DistributedMapOnFailureConfig,
+    DistributedMapOnSuccessConfig,
+    DistributedMapDestinationInclude,
+    DistributedMapDestinationType,
+    DistributedMapDestinationConfig,
+    DistributedMapFunctionResponseType,
     DistributedMapOptions,
-    DistributedMapReaderConfigWire,
+    DistributedMapProcessorConfig,
+    DistributedMapReaderFunctionSourceConfig,
     DistributedMapResultCollectionMode,
-    DistributedMapResultCollectionWire,
+    DistributedMapResultCollectionConfig,
+    DistributedMapS3DestinationConfig,
+    DistributedMapS3SourceConfig,
+    DistributedMapS3SourceTransform,
     DistributedMapSourceType,
-    DistributedMapSourceWire,
-    DistributedMapStatus,
+    DistributedMapSourceConfig,
     OperationStatus,
     OperationUpdate,
 )
@@ -64,76 +80,207 @@ logger = logging.getLogger(__name__)
 # Size limits for the inline item list (1 MB) and the reader's saved state (32 KB).
 _INLINE_SIZE_LIMIT = 1024 * 1024
 _READER_STATE_LIMIT = 32 * 1024
+_UNLIMITED_RETRY_WIRE = -1
+
+_RESPONSE_TYPE_FOR_MODE = {
+    ProcessorResponseMode.ITEM_FAILURES: DistributedMapFunctionResponseType.REPORT_BATCH_ITEM_FAILURES,
+    ProcessorResponseMode.ITEM_RESULTS: DistributedMapFunctionResponseType.REPORT_BATCH_ITEM_RESULTS,
+}
 
 
-def _inline_items_to_wire(
+def _build_inline_items(
     items: tuple[Any, ...],
     serdes: Any,
     operation_id: str,
     durable_execution_arn: str,
-) -> tuple[Any, ...]:
-    """Serialize each inline item to its wire JSON value, enforcing the 1 MB cap."""
-    wire_items: list[Any] = []
+) -> tuple[str, ...]:
+    """Serialize each inline item, enforcing the 1 MB cap on the whole list."""
+    serialized_items: list[str] = []
     for item in items:
-        serialized = serialize(
-            serdes=serdes,
-            value=item,
-            operation_id=operation_id,
-            durable_execution_arn=durable_execution_arn,
+        serialized_items.append(
+            serialize(
+                serdes=serdes,
+                value=item,
+                operation_id=operation_id,
+                durable_execution_arn=durable_execution_arn,
+            )
         )
-        try:
-            wire_items.append(json.loads(serialized))
-        except json.JSONDecodeError as e:
-            msg = "inline source serdes must produce a JSON value for each item"
-            raise ValidationError(msg) from e
-    total = len(json.dumps(wire_items, separators=(",", ":")).encode("utf-8"))
+    total = len(json.dumps(serialized_items, separators=(",", ":")).encode("utf-8"))
     if total > _INLINE_SIZE_LIMIT:
         msg = (
             f"inline source exceeds the {_INLINE_SIZE_LIMIT // 1024 // 1024} MB limit "
             f"(serialized size: {total} bytes)"
         )
         raise ValidationError(msg)
-    return tuple(wire_items)
+    return tuple(serialized_items)
 
 
-def _source_to_wire(
+def _build_completion_config(
+    completion_config: Any,
+) -> DistributedMapCompletionConfig | None:
+    """Translate the completion config, or None when it carries no threshold."""
+    if (
+        completion_config.tolerated_failure_count is None
+        and completion_config.tolerated_failure_percentage is None
+        and completion_config.minimum_sample_size is None
+    ):
+        return None
+    return DistributedMapCompletionConfig(
+        tolerated_failure_count=completion_config.tolerated_failure_count,
+        tolerated_failure_percentage=completion_config.tolerated_failure_percentage,
+        minimum_sample_size=completion_config.minimum_sample_size,
+    )
+
+
+def _build_processor_config(
+    processor: DistributedMapProcessor,
+) -> DistributedMapProcessorConfig:
+    """Translate the processor, mapping the response mode and unlimited retries."""
+    response_type = _RESPONSE_TYPE_FOR_MODE.get(processor.response_mode)
+    max_retry_attempts: int | None = None
+    max_retry_duration_seconds: int | None = None
+    attempts = processor.max_retry_attempts
+    if attempts == DistributedMapProcessor.UNLIMITED:
+        max_retry_attempts = _UNLIMITED_RETRY_WIRE
+    elif isinstance(attempts, int):
+        max_retry_attempts = attempts
+    if processor.max_retry_duration is not None:
+        max_retry_duration_seconds = processor.max_retry_duration.to_seconds()
+    return DistributedMapProcessorConfig(
+        function_name=processor.function_name,
+        function_response_types=(response_type,) if response_type else None,
+        batch_size=processor.batch_size,
+        max_retry_attempts=max_retry_attempts,
+        max_retry_duration_seconds=max_retry_duration_seconds,
+        durable_execution_name_prefix=processor.durable_execution_name_prefix,
+    )
+
+
+def _transform_for(s3: Any) -> DistributedMapS3SourceTransform | None:
+    """A prefix source flattens when a format is set, and lists keys when it is not."""
+    if s3.prefix is None:
+        return None
+    if s3.fmt is None:
+        return DistributedMapS3SourceTransform.NONE
+    return DistributedMapS3SourceTransform.LOAD_AND_FLATTEN
+
+
+def _build_s3_source_config(s3: Any) -> DistributedMapS3SourceConfig:
+    """Translate the S3 source, deriving the transform and CSV header location."""
+    csv_format_options: DistributedMapCsvFormatOptions | None = None
+    if s3.fmt is DistributedMapSourceFormat.CSV:
+        csv_format_options = DistributedMapCsvFormatOptions(
+            header_location=(
+                DistributedMapCsvHeaderLocation.GIVEN
+                if s3.headers is not None
+                else DistributedMapCsvHeaderLocation.FIRST_ROW
+            ),
+            headers=s3.headers,
+            delimiter=s3.delimiter,
+        )
+    return DistributedMapS3SourceConfig(
+        bucket=s3.bucket,
+        key=s3.key,
+        key_prefix=s3.prefix,
+        transform=_transform_for(s3),
+        expected_bucket_owner=s3.expected_bucket_owner,
+        fmt=s3.fmt,
+        csv_format_options=csv_format_options,
+    )
+
+
+def _destination_entry_fields(
+    destination: Any, *, second_include: DistributedMapDestinationInclude
+) -> dict[str, Any]:
+    """Build the members the OnSuccess and OnFailure shapes share."""
+    include: list[DistributedMapDestinationInclude] = []
+    if destination.include_input:
+        include.append(DistributedMapDestinationInclude.INPUT)
+    if second_include is DistributedMapDestinationInclude.OUTPUT:
+        if destination.include_output:
+            include.append(second_include)
+    elif destination.include_error:
+        include.append(second_include)
+    return {
+        "type": DistributedMapDestinationType.S3,
+        "include": tuple(include),
+        "s3_destination_config": DistributedMapS3DestinationConfig(
+            bucket=destination.bucket,
+            key_prefix=destination.prefix,
+            expected_bucket_owner=destination.expected_bucket_owner,
+        ),
+    }
+
+
+def _build_destination_config(
+    destination: Any,
+) -> DistributedMapDestinationConfig | None:
+    """Translate the destination config, or None when neither side is set."""
+    on_success = (
+        DistributedMapOnSuccessConfig(
+            **_destination_entry_fields(
+                destination.on_success,
+                second_include=DistributedMapDestinationInclude.OUTPUT,
+            )
+        )
+        if destination.on_success is not None
+        else None
+    )
+    on_failure = (
+        DistributedMapOnFailureConfig(
+            **_destination_entry_fields(
+                destination.on_failure,
+                second_include=DistributedMapDestinationInclude.ERROR,
+            )
+        )
+        if destination.on_failure is not None
+        else None
+    )
+    if on_success is None and on_failure is None:
+        return None
+    return DistributedMapDestinationConfig(on_success=on_success, on_failure=on_failure)
+
+
+def _build_source_config(
     source: DistributedMapSource | Sequence[Any],
     operation_id: str,
     durable_execution_arn: str,
-) -> DistributedMapSourceWire:
-    """Translate a source (typed or plain-list shorthand) into its wire form."""
+) -> DistributedMapSourceConfig:
+    """Translate a source (typed or plain-list shorthand) into its source config."""
     if not isinstance(source, DistributedMapSource):
         # A plain list is treated as an inline source with the default serializer.
-        wire_items = _inline_items_to_wire(
+        serialized_items = _build_inline_items(
             tuple(source), DEFAULT_JSON_SERDES, operation_id, durable_execution_arn
         )
-        return DistributedMapSourceWire(
-            source_type=DistributedMapSourceType.INLINE, inline_items=wire_items
+        return DistributedMapSourceConfig(
+            source_type=DistributedMapSourceType.INLINE,
+            inline_source_config=DistributedMapInlineSourceConfig(
+                items=serialized_items
+            ),
         )
 
-    if source.source_type is DistributedMapSourceType.INLINE:
-        wire_items = _inline_items_to_wire(
-            source.inline_items or (),
+    if source.inline_items is not None:
+        serialized_items = _build_inline_items(
+            source.inline_items,
             source.inline_serdes or DEFAULT_JSON_SERDES,
             operation_id,
             durable_execution_arn,
         )
-        return DistributedMapSourceWire(
+        return DistributedMapSourceConfig(
             source_type=DistributedMapSourceType.INLINE,
-            inline_items=wire_items,
+            inline_source_config=DistributedMapInlineSourceConfig(
+                items=serialized_items
+            ),
             max_items=source.max_items,
         )
-    if source.source_type is DistributedMapSourceType.S3 and source.s3 is not None:
-        return DistributedMapSourceWire(
+    if source.s3 is not None:
+        return DistributedMapSourceConfig(
             source_type=DistributedMapSourceType.S3,
             max_items=source.max_items,
-            s3_config=source.s3.to_wire(),
+            s3_config=_build_s3_source_config(source.s3),
         )
-    if (
-        source.source_type is DistributedMapSourceType.READER_FUNCTION
-        and source.reader is not None
-    ):
-        reader_config = DistributedMapReaderConfigWire(
+    if source.reader is not None:
+        reader_config = DistributedMapReaderFunctionSourceConfig(
             function_name=source.reader.function_name
         )
         if source.reader.initial_state is not None:
@@ -149,15 +296,15 @@ def _source_to_wire(
                     f"{_READER_STATE_LIMIT // 1024} KB limit"
                 )
                 raise ValidationError(msg)
-            reader_config = DistributedMapReaderConfigWire(
+            reader_config = DistributedMapReaderFunctionSourceConfig(
                 function_name=source.reader.function_name, initial_state=state
             )
-        return DistributedMapSourceWire(
+        return DistributedMapSourceConfig(
             source_type=DistributedMapSourceType.READER_FUNCTION,
             max_items=source.max_items,
             reader_config=reader_config,
         )
-    msg = f"Unsupported map run source type: {source.source_type}"
+    msg = "Distributed map source has no configured items"
     raise ExecutionError(msg)
 
 
@@ -169,23 +316,25 @@ def _build_distributed_map_options(
     operation_id: str,
     durable_execution_arn: str,
 ) -> DistributedMapOptions:
-    """Assemble the wire options payload from the operands and config."""
+    """Assemble the DistributedMapOptions payload from the operands and config."""
     result_collection = (
-        DistributedMapResultCollectionWire(
+        DistributedMapResultCollectionConfig(
             mode=DistributedMapResultCollectionMode.INLINE
         )
-        if config.collect_results
+        if isinstance(config, DistributedMapResultConfig)
         else None
     )
     return DistributedMapOptions(
         max_concurrency=max_concurrency,
-        source=_source_to_wire(source, operation_id, durable_execution_arn),
-        processor=processor.to_wire(),
+        source=_build_source_config(source, operation_id, durable_execution_arn),
+        processor=_build_processor_config(processor),
         destination=(
-            config.destination.to_wire() if config.destination is not None else None
+            _build_destination_config(config.destination)
+            if config.destination is not None
+            else None
         ),
         completion_config=(
-            config.completion_config.to_wire()
+            _build_completion_config(config.completion_config)
             if config.completion_config is not None
             else None
         ),
@@ -194,26 +343,6 @@ def _build_distributed_map_options(
         if config.timeout is not None
         else None,
     )
-
-
-def _summary_fields(
-    details: DistributedMapDetails, status: DistributedMapStatus
-) -> dict[str, Any]:
-    """Shared summary fields extracted from the terminal details block.
-
-    ``status`` is resolved by the caller (from details, or the operation when
-    details omit it) since the backend no longer sends Status on the details.
-    """
-    return {
-        "status": status,
-        "completion_reason": details.completion_reason,
-        "success_count": details.success_count,
-        "failure_count": details.failure_count,
-        "unprocessed_count": details.unprocessed_count,
-        "distributed_map_run_arn": details.distributed_map_run_arn,
-        "completion_details": details.completion_details,
-        "total_count": details.total_count,
-    }
 
 
 def _distributed_map_status_from_operation(
@@ -281,48 +410,69 @@ class DistributedMapOperationExecutor(OperationExecutor[DistributedMapSummary]):
         self.operation_identifier = operation_identifier
         self.config = config
 
-    def _resolve_summary(
-        self, operation: Operation | None
-    ) -> DistributedMapSummary:
+    def _resolve_summary(self, operation: Operation | None) -> DistributedMapSummary:
         """Reconstruct the resolved summary/result from the terminal operation."""
         details = operation.distributed_map_details if operation else None
         if details is None:
             msg = "DISTRIBUTED_MAP operation succeeded but carried no DistributedMapDetails"
             raise ExecutionError(msg)
-        # Status is no longer sent on details; derive it from the operation when absent.
-        status = details.status or _distributed_map_status_from_operation(operation)
-        fields = _summary_fields(details, status)
-        if not self.config.collect_results:
-            return DistributedMapSummary(**fields)
-        return DistributedMapResult(**fields, all=self._deserialize_items(details))
+        status = _distributed_map_status_from_operation(operation)
+        completion_reason = details.completion_reason
+        if completion_reason is None:
+            msg = (
+                f"DISTRIBUTED_MAP operation ended {status.value} but carried no "
+                f"CompletionReason"
+            )
+            raise ExecutionError(msg)
+        if not isinstance(self.config, DistributedMapResultConfig):
+            return DistributedMapSummary(
+                status=status,
+                completion_reason=completion_reason,
+                success_count=details.success_count,
+                failure_count=details.failure_count,
+                unprocessed_count=details.unprocessed_count,
+                distributed_map_run_arn=details.distributed_map_run_arn,
+                completion_details=details.completion_details,
+                total_count=details.total_count,
+            )
+        return DistributedMapResult(
+            status=status,
+            completion_reason=completion_reason,
+            success_count=details.success_count,
+            failure_count=details.failure_count,
+            unprocessed_count=details.unprocessed_count,
+            distributed_map_run_arn=details.distributed_map_run_arn,
+            completion_details=details.completion_details,
+            total_count=details.total_count,
+            all=self._deserialize_items(details, self.config.result_serdes),
+        )
 
     def _deserialize_items(
-        self, details: DistributedMapDetails
+        self, details: DistributedMapDetails, result_serdes: Any
     ) -> list[DistributedMapResultItem]:
-        """Deserialize the per-item wire results into customer result items."""
+        """Deserialize the service result items into customer result items."""
         items: list[DistributedMapResultItem] = []
-        for wire in details.results or ():
+        for entry in details.results or ():
             output: Any | None = None
-            if wire.output is not None:
-                # Output is already a JSON value; re-dump to text for the serdes.
+            if entry.output is not None:
                 output = deserialize(
-                    serdes=self.config.result_serdes or DEFAULT_JSON_SERDES,
-                    data=json.dumps(wire.output),
+                    serdes=result_serdes or DEFAULT_JSON_SERDES,
+                    data=entry.output,
                     operation_id=self.operation_identifier.operation_id,
                     durable_execution_arn=self.state.durable_execution_arn,
                 )
             error = (
                 DistributedMapItemError(
-                    error_type=wire.error.type or "",
-                    error_message=wire.error.message or "",
+                    error_type=entry.error.type or "",
+                    error_message=entry.error.message or "",
                 )
-                if wire.error is not None
+                if entry.error is not None
                 else None
             )
             items.append(
                 DistributedMapResultItem(
-                    item_id=wire.item_id,
-                    status=wire.status,
+                    item_id=entry.item_id,
+                    status=entry.status,
                     output=output,
                     error=error,
                 )
@@ -351,19 +501,26 @@ class DistributedMapOperationExecutor(OperationExecutor[DistributedMapSummary]):
             summary = self._resolve_summary(operation)
             return CheckResult.create_completed(summary)
 
-        # Operation-level terminal failure
+        # Operation-level terminal failure. Every terminal state resolves with the
+        # summary, and throw_if_error opts into raising.
         if (
             checkpointed_result.is_failed()
             or checkpointed_result.is_timed_out()
             or checkpointed_result.is_stopped()
         ):
-            msg = (
-                f"Distributed map operation "
-                f"'{self.operation_identifier.name or self.operation_identifier.operation_id}' "
-                f"ended with status "
-                f"{checkpointed_result.status.value if checkpointed_result.status else 'UNKNOWN'}"
+            operation = checkpointed_result.operation
+            if operation is not None and operation.distributed_map_details is not None:
+                return CheckResult.create_completed(self._resolve_summary(operation))
+            status_value = (
+                checkpointed_result.status.value
+                if checkpointed_result.status
+                else "UNKNOWN"
             )
-            checkpointed_result.raise_operation_error(DistributedMapError, msg=msg)
+            msg = (
+                f"DISTRIBUTED_MAP operation ended {status_value} but carried no "
+                f"DistributedMapDetails"
+            )
+            raise ExecutionError(msg)
 
         # Started - ready to suspend
         if checkpointed_result.is_started():

@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 import pytest
 
-from aws_durable_execution_sdk_python.dmap import (
+from aws_durable_execution_sdk_python.config import (
+    DistributedMapConfig,
+    DistributedMapProcessor,
+    DistributedMapStatus,
+)
+from aws_durable_execution_sdk_python.dmap.handlers import (
     ReaderPage,
     create_distributed_map_batch_handler,
     create_distributed_map_item_handler,
@@ -15,14 +22,13 @@ from aws_durable_execution_sdk_python.exceptions import ExecutionError, Validati
 from aws_durable_execution_sdk_python.lambda_service import (
     DistributedMapCompletionReason,
     DistributedMapDetails,
-    DistributedMapStatus,
     Operation,
     OperationStatus,
     OperationType,
 )
 from aws_durable_execution_sdk_python.operation.dmap import (
+    DistributedMapOperationExecutor,
     _distributed_map_status_from_operation,
-    _summary_fields,
 )
 
 
@@ -38,17 +44,14 @@ def _terminal_operation(
 
 
 def test_status_derived_from_operation_when_details_omit_status():
-    """Backend drops Status from details; status is taken from the operation."""
+    """Status comes from the operation, not from details."""
     details = DistributedMapDetails(
         completion_reason=DistributedMapCompletionReason.ALL_COMPLETED,
         success_count=3,
         total_count=3,
     )
-    assert details.status is None
     op = _terminal_operation(OperationStatus.SUCCEEDED, details)
-    assert (
-        _distributed_map_status_from_operation(op) is DistributedMapStatus.SUCCEEDED
-    )
+    assert _distributed_map_status_from_operation(op) is DistributedMapStatus.SUCCEEDED
 
 
 def test_status_from_operation_rejects_non_terminal():
@@ -61,8 +64,8 @@ def test_status_from_operation_rejects_non_terminal():
         _distributed_map_status_from_operation(op)
 
 
-def test_summary_fields_uses_resolved_status_not_details():
-    """_summary_fields takes the resolved status arg even when details.status is None."""
+def test_resolved_summary_uses_operation_status_not_details():
+    """_resolve_summary carries the derived status when details omit it."""
     details = DistributedMapDetails(
         completion_reason=DistributedMapCompletionReason.ALL_COMPLETED,
         success_count=2,
@@ -70,10 +73,20 @@ def test_summary_fields_uses_resolved_status_not_details():
         unprocessed_count=0,
         total_count=2,
     )
-    fields = _summary_fields(details, DistributedMapStatus.SUCCEEDED)
-    assert fields["status"] is DistributedMapStatus.SUCCEEDED
-    assert fields["completion_reason"] is DistributedMapCompletionReason.ALL_COMPLETED
-    assert fields["success_count"] == 2
+    executor = DistributedMapOperationExecutor(
+        source=["a", "b"],
+        processor=DistributedMapProcessor.batch("proc"),
+        max_concurrency=1,
+        state=MagicMock(),
+        operation_identifier=MagicMock(),
+        config=DistributedMapConfig(),
+    )
+    summary = executor._resolve_summary(
+        _terminal_operation(OperationStatus.SUCCEEDED, details)
+    )
+    assert summary.status is DistributedMapStatus.SUCCEEDED
+    assert summary.completion_reason is DistributedMapCompletionReason.ALL_COMPLETED
+    assert summary.success_count == 2
 
 
 def test_item_handler_invalid_report_rejected():
@@ -91,11 +104,11 @@ def test_durable_item_handler_invalid_report_rejected():
 def test_item_handler_reports_results_in_order():
     handler = create_distributed_map_item_handler(lambda x: x * 2)
     resp = handler(
-        {"records": [{"itemId": "0", "body": 2}, {"itemId": "1", "body": 3}]}
+        {"records": [{"itemId": "0", "body": "2"}, {"itemId": "1", "body": "3"}]}
     )
     assert resp["batchItemResults"] == [
-        {"itemIdentifier": "0", "output": 4},
-        {"itemIdentifier": "1", "output": 6},
+        {"itemIdentifier": "0", "output": "4"},
+        {"itemIdentifier": "1", "output": "6"},
     ]
     assert resp["batchItemFailures"] == []
 
@@ -109,9 +122,9 @@ def test_item_handler_captures_failures():
 
     handler = create_distributed_map_item_handler(process)
     resp = handler(
-        {"records": [{"itemId": "0", "body": "ok"}, {"itemId": "1", "body": "bad"}]}
+        {"records": [{"itemId": "0", "body": '"ok"'}, {"itemId": "1", "body": '"bad"'}]}
     )
-    assert resp["batchItemResults"] == [{"itemIdentifier": "0", "output": "ok"}]
+    assert resp["batchItemResults"] == [{"itemIdentifier": "0", "output": '"ok"'}]
     assert resp["batchItemFailures"] == [
         {
             "itemIdentifier": "1",
@@ -122,7 +135,7 @@ def test_item_handler_captures_failures():
 
 def test_item_handler_failures_form_reports_only_failures():
     handler = create_distributed_map_item_handler(lambda x: x, report="failures")
-    resp = handler({"records": [{"itemId": "0", "body": 1}]})
+    resp = handler({"records": [{"itemId": "0", "body": "1"}]})
     assert resp == {"batchItemFailures": []}
 
 
@@ -132,7 +145,9 @@ def test_batch_handler_success_and_propagates_error():
         lambda items: seen.extend(items) or "done"
     )
     assert (
-        handler({"records": [{"itemId": "0", "body": 1}, {"itemId": "1", "body": 2}]})
+        handler(
+            {"records": [{"itemId": "0", "body": "1"}, {"itemId": "1", "body": "2"}]}
+        )
         == "done"
     )
     assert seen == [1, 2]
@@ -143,7 +158,7 @@ def test_batch_handler_success_and_propagates_error():
 
     failing = create_distributed_map_batch_handler(boom)
     with pytest.raises(RuntimeError, match="batch failed"):
-        failing({"records": [{"itemId": "0", "body": 1}]})
+        failing({"records": [{"itemId": "0", "body": "1"}]})
 
 
 def test_reader_returns_items_and_next_state_then_exhausts():

@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from unittest.mock import Mock, patch
 
-from aws_durable_execution_sdk_python.dmap import (
+from aws_durable_execution_sdk_python.dmap.handlers import (
     create_distributed_map_batch_handler_with_durable_execution,
     create_distributed_map_item_handler_with_durable_execution,
 )
@@ -101,12 +101,12 @@ def test_durable_item_handler_reports_results():
     handler = create_distributed_map_item_handler_with_durable_execution(
         lambda _ctx, item: item * 2
     )
-    result = _run(handler, [{"itemId": "0", "body": 2}, {"itemId": "1", "body": 3}])
+    result = _run(handler, [{"itemId": "0", "body": "2"}, {"itemId": "1", "body": "3"}])
     assert result["Status"] == InvocationStatus.SUCCEEDED.value
     data = json.loads(result["Result"])
     assert data["batchItemResults"] == [
-        {"itemIdentifier": "0", "output": 4},
-        {"itemIdentifier": "1", "output": 6},
+        {"itemIdentifier": "0", "output": "4"},
+        {"itemIdentifier": "1", "output": "6"},
     ]
     assert data["batchItemFailures"] == []
 
@@ -120,11 +120,11 @@ def test_durable_item_handler_captures_failure():
 
     handler = create_distributed_map_item_handler_with_durable_execution(process)
     result = _run(
-        handler, [{"itemId": "0", "body": "ok"}, {"itemId": "1", "body": "bad"}]
+        handler, [{"itemId": "0", "body": '"ok"'}, {"itemId": "1", "body": '"bad"'}]
     )
     assert result["Status"] == InvocationStatus.SUCCEEDED.value
     data = json.loads(result["Result"])
-    assert data["batchItemResults"] == [{"itemIdentifier": "0", "output": "ok"}]
+    assert data["batchItemResults"] == [{"itemIdentifier": "0", "output": '"ok"'}]
     assert data["batchItemFailures"][0]["itemIdentifier"] == "1"
     assert data["batchItemFailures"][0]["error"]["errorType"] == "ValueError"
 
@@ -133,7 +133,7 @@ def test_durable_batch_handler_returns_value():
     handler = create_distributed_map_batch_handler_with_durable_execution(
         lambda _ctx, items: {"count": len(items)}
     )
-    result = _run(handler, [{"itemId": "0", "body": 1}, {"itemId": "1", "body": 2}])
+    result = _run(handler, [{"itemId": "0", "body": "1"}, {"itemId": "1", "body": "2"}])
     assert result["Status"] == InvocationStatus.SUCCEEDED.value
     assert json.loads(result["Result"]) == {"count": 2}
 
@@ -142,7 +142,7 @@ def test_durable_item_handler_failures_form():
     handler = create_distributed_map_item_handler_with_durable_execution(
         lambda _ctx, item: item, report="failures"
     )
-    result = _run(handler, [{"itemId": "0", "body": 1}])
+    result = _run(handler, [{"itemId": "0", "body": "1"}])
     assert result["Status"] == InvocationStatus.SUCCEEDED.value
     data = json.loads(result["Result"])
     assert data == {"batchItemFailures": []}

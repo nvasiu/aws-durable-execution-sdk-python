@@ -206,22 +206,12 @@ def durable_execution(
                     "durableExecutionArn: %s", event.get("DurableExecutionArn")
                 )
                 invocation_input = DurableExecutionInvocationInput.from_json_dict(event)
-            except (KeyError, TypeError, AttributeError):
-                # Malformed input is non-retryable, return a FAILED durable output so the backend surfaces the real cause instead of a null Status.
+            except (KeyError, TypeError, AttributeError) as e:
                 msg = (
                     "Unexpected payload provided to start the durable execution. "
                     "Check your resource configurations to confirm the durability is set."
                 )
-                return DurableExecutionInvocationOutput(
-                    status=InvocationStatus.FAILED,
-                    error=ErrorObject.from_exception(ExecutionError(msg)),
-                ).to_dict()
-            except ExecutionError as e:
-                # Invalid invocation input is non-retryable, return a FAILED durable output so the backend surfaces the real cause instead of a null Status.
-                return DurableExecutionInvocationOutput(
-                    status=InvocationStatus.FAILED,
-                    error=ErrorObject.from_exception(e),
-                ).to_dict()
+                raise ExecutionError(msg) from e
 
             # Use custom client if provided, otherwise initialize from environment
             service_client = (

@@ -1096,17 +1096,17 @@ def test_wait_with_time_less_than_one(mock_executor_class):
 
 
 # region distributed_map
-@pytest.mark.parametrize("max_concurrency", [0, -1])
-def test_map_run_rejects_non_positive_max_concurrency(max_concurrency: int):
-    """Test distributed_map raises ValidationError when max_concurrency is not positive."""
+@pytest.mark.parametrize("max_concurrency", [0, -1, 10001, 50000])
+def test_map_run_rejects_out_of_range_max_concurrency(max_concurrency: int):
+    """Test distributed_map rejects a max_concurrency outside the service range."""
     context = create_test_context()
 
     with pytest.raises(
-        ValidationError, match="max_concurrency must be greater than zero"
+        ValidationError, match="max_concurrency must be between 1 and 10000"
     ):
         context.distributed_map(
             ["a"],
-            DistributedMapProcessor.report_batch_outcome("test_processor"),
+            DistributedMapProcessor.batch("test_processor"),
             max_concurrency=max_concurrency,
         )
 
@@ -1122,7 +1122,7 @@ def test_distributed_map_rejects_non_list_source(source):
     with pytest.raises(ValidationError, match="list/tuple"):
         context.distributed_map(
             source,
-            DistributedMapProcessor.report_batch_outcome("test_processor"),
+            DistributedMapProcessor.batch("test_processor"),
             max_concurrency=1,
         )
 
@@ -1137,7 +1137,7 @@ def test_distributed_map_basic(mock_executor_class):
     mock_state.durable_execution_arn = (
         "arn:aws:durable:us-east-1:123456789012:execution/test"
     )
-    processor = DistributedMapProcessor.report_batch_outcome("test_processor")
+    processor = DistributedMapProcessor.batch("test_processor")
 
     context = create_test_context(state=mock_state)
     expected_operation_id = next(operation_id_sequence())
@@ -1168,7 +1168,7 @@ def test_distributed_map_with_name_and_config(mock_executor_class):
     mock_state.durable_execution_arn = (
         "arn:aws:durable:us-east-1:123456789012:execution/test"
     )
-    processor = DistributedMapProcessor.report_batch_outcome("test_processor")
+    processor = DistributedMapProcessor.batch("test_processor")
     config = DistributedMapConfig()
 
     context = create_test_context(state=mock_state)
@@ -1206,7 +1206,7 @@ def test_distributed_map_with_parent_id(mock_executor_class):
     mock_state.durable_execution_arn = (
         "arn:aws:durable:us-east-1:123456789012:execution/test"
     )
-    processor = DistributedMapProcessor.report_batch_outcome("test_processor")
+    processor = DistributedMapProcessor.batch("test_processor")
 
     context = create_test_context(state=mock_state, parent_id="parent123")
     [context._create_step_id() for _ in range(2)]  # Set counter to 2 # noqa: SLF001
@@ -1240,7 +1240,7 @@ def test_distributed_map_increments_counter(mock_executor_class):
     mock_state.durable_execution_arn = (
         "arn:aws:durable:us-east-1:123456789012:execution/test"
     )
-    processor = DistributedMapProcessor.report_batch_outcome("test_processor")
+    processor = DistributedMapProcessor.batch("test_processor")
 
     context = create_test_context(state=mock_state)
     [context._create_step_id() for _ in range(10)]  # Set counter to 10 # noqa: SLF001
@@ -1272,7 +1272,7 @@ def test_distributed_map_defaults_config_when_none(mock_executor_class):
     mock_state.durable_execution_arn = (
         "arn:aws:durable:us-east-1:123456789012:execution/test"
     )
-    processor = DistributedMapProcessor.report_batch_outcome("test_processor")
+    processor = DistributedMapProcessor.batch("test_processor")
 
     context = create_test_context(state=mock_state)
     context.distributed_map(["a"], processor, max_concurrency=1)
@@ -1292,7 +1292,7 @@ def test_distributed_map_returns_process_result(mock_executor_class):
     mock_state.durable_execution_arn = (
         "arn:aws:durable:us-east-1:123456789012:execution/test"
     )
-    processor = DistributedMapProcessor.report_batch_outcome("test_processor")
+    processor = DistributedMapProcessor.batch("test_processor")
 
     context = create_test_context(state=mock_state)
     result = context.distributed_map(["a"], processor, max_concurrency=1)

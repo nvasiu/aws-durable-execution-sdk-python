@@ -7,12 +7,27 @@ import logging
 from collections.abc import MutableMapping
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, NoReturn, Protocol, TypeAlias, TypeVar, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    NoReturn,
+    Protocol,
+    Self,
+    TypeAlias,
+    TypeVar,
+    cast,
+)
 
 import boto3
 from botocore.config import Config
 
 from aws_durable_execution_sdk_python.__about__ import __version__
+from aws_durable_execution_sdk_python.config import (
+    DistributedMapCompletionReason,
+    DistributedMapCsvDelimiter,
+    DistributedMapItemStatus,
+    DistributedMapSourceFormat,
+)
 from aws_durable_execution_sdk_python.exceptions import (
     CheckpointError,
     DurableOperationError,
@@ -108,61 +123,15 @@ class CallbackTimeoutType(Enum):
     HEARTBEAT = "Callback.Heartbeat"
 
 
-class DistributedMapStatus(Enum):
-    SUCCEEDED = "SUCCEEDED"
-    FAILED = "FAILED"
-    STOPPED = "STOPPED"
-    TIMED_OUT = "TIMED_OUT"
-
-
-class DistributedMapItemStatus(Enum):
-    """Terminal status of a single map run item."""
-
-    SUCCEEDED = "SUCCEEDED"
-    FAILED = "FAILED"
-
-
-class DistributedMapCompletionReason(Enum):
-    ALL_COMPLETED = "ALL_COMPLETED"
-    ITEM_LIMIT_REACHED = "ITEM_LIMIT_REACHED"
-    STOPPED = "STOPPED"
-    TIMED_OUT = "TIMED_OUT"
-    FAILURE_TOLERANCE_EXCEEDED = "FAILURE_TOLERANCE_EXCEEDED"
-    SOURCE_FAILED = "SOURCE_FAILED"
-    DESTINATION_FAILED = "DESTINATION_FAILED"
-    INLINE_RESULT_LIMIT_EXCEEDED = "INLINE_RESULT_LIMIT_EXCEEDED"
-    INVALID_CONFIGURATION = "INVALID_CONFIGURATION"
-    QUOTA_EXCEEDED = "QUOTA_EXCEEDED"
-    KMS_ACCESS_DENIED = "KMS_ACCESS_DENIED"
-    INTERNAL_ERROR = "INTERNAL_ERROR"
-    UNKNOWN_TO_SDK_VERSION = "UNKNOWN_TO_SDK_VERSION"
-
-
 class DistributedMapSourceType(Enum):
     INLINE = "INLINE"
     S3 = "S3"
     READER_FUNCTION = "READER_FUNCTION"
 
 
-class DistributedMapS3Transform(Enum):
+class DistributedMapS3SourceTransform(Enum):
     NONE = "NONE"
     LOAD_AND_FLATTEN = "LOAD_AND_FLATTEN"
-
-
-class DistributedMapSourceFormat(Enum):
-    JSON_LINES = "JSON_LINES"
-    JSON_ARRAY = "JSON_ARRAY"
-    CSV = "CSV"
-
-
-class DistributedMapCsvDelimiter(Enum):
-    """Column delimiter for a CSV distributed map source."""
-
-    COMMA = "COMMA"
-    PIPE = "PIPE"
-    SEMICOLON = "SEMICOLON"
-    SPACE = "SPACE"
-    TAB = "TAB"
 
 
 class DistributedMapCsvHeaderLocation(Enum):
@@ -491,16 +460,16 @@ def _parse_enum(
 
 
 @dataclass(frozen=True)
-class DistributedMapResultItemWire:
-    """Wire representation of a single map run item's outcome."""
+class DistributedMapResultItem:
+    """Represent a single map run item's outcome."""
 
     item_id: str
     status: DistributedMapItemStatus
-    output: Any | None = None
+    output: str | None = None
     error: ErrorObject | None = None
 
     @classmethod
-    def from_dict(cls, data: MutableMapping[str, Any]) -> DistributedMapResultItemWire:
+    def from_dict(cls, data: MutableMapping[str, Any]) -> DistributedMapResultItem:
         error_raw = data.get("Error")
         return cls(
             item_id=data.get("ItemId", ""),
@@ -525,7 +494,6 @@ class DistributedMapResultItemWire:
 
 @dataclass(frozen=True)
 class DistributedMapDetails:
-    status: DistributedMapStatus | None = None
     completion_reason: DistributedMapCompletionReason | None = None
     distributed_map_run_arn: str | None = None
     completion_details: str | None = None
@@ -533,22 +501,15 @@ class DistributedMapDetails:
     success_count: int = 0
     failure_count: int = 0
     unprocessed_count: int = 0
-    results: tuple[DistributedMapResultItemWire, ...] | None = None
+    results: tuple[DistributedMapResultItem, ...] | None = None
 
     @classmethod
     def from_dict(cls, data: MutableMapping[str, Any]) -> DistributedMapDetails:
         results_raw = data.get("Results")
-        status_raw = data.get("Status")
         reason_raw = data.get("CompletionReason")
-        # Status and CompletionReason are omitted while a run is in flight; the
-        # backend also moved run status off details onto the operation, so parse
-        # each only when present rather than requiring it.
+        # CompletionReason is absent while a run is in flight, so parse it only
+        # when present rather than requiring it.
         return cls(
-            status=(
-                _parse_enum(DistributedMapStatus, status_raw, "status")
-                if status_raw is not None
-                else None
-            ),
             completion_reason=(
                 _parse_enum(
                     DistributedMapCompletionReason,
@@ -566,7 +527,7 @@ class DistributedMapDetails:
             failure_count=data.get("FailureCount", 0),
             unprocessed_count=data.get("UnprocessedCount", 0),
             results=tuple(
-                DistributedMapResultItemWire.from_dict(item) for item in results_raw
+                DistributedMapResultItem.from_dict(item) for item in results_raw
             )
             if results_raw is not None
             else None,
@@ -669,8 +630,8 @@ class ChainedInvokeOptions:
 
 
 @dataclass(frozen=True)
-class DistributedMapCsvFormatOptionsWire:
-    """Wire representation of CSV format options for an S3 source."""
+class DistributedMapCsvFormatOptions:
+    """Represent CSV format options for an S3 source."""
 
     header_location: DistributedMapCsvHeaderLocation
     headers: tuple[str, ...] | None = None
@@ -689,7 +650,7 @@ class DistributedMapCsvFormatOptionsWire:
     @classmethod
     def from_dict(
         cls, data: MutableMapping[str, Any]
-    ) -> DistributedMapCsvFormatOptionsWire:
+    ) -> DistributedMapCsvFormatOptions:
         headers = data.get("Headers")
         delimiter = data.get("Delimiter")
         return cls(
@@ -704,16 +665,16 @@ class DistributedMapCsvFormatOptionsWire:
 
 
 @dataclass(frozen=True)
-class DistributedMapS3SourceConfigWire:
-    """Wire representation of an S3 distributed map source config."""
+class DistributedMapS3SourceConfig:
+    """Represent an S3 distributed map source config."""
 
     bucket: str
     key: str | None = None
     key_prefix: str | None = None
-    transform: DistributedMapS3Transform | None = None
+    transform: DistributedMapS3SourceTransform | None = None
     expected_bucket_owner: str | None = None
     fmt: DistributedMapSourceFormat | None = None
-    csv_format_options: DistributedMapCsvFormatOptionsWire | None = None
+    csv_format_options: DistributedMapCsvFormatOptions | None = None
 
     def to_dict(self) -> MutableMapping[str, Any]:
         result: MutableMapping[str, Any] = {"Bucket": self.bucket}
@@ -732,9 +693,7 @@ class DistributedMapS3SourceConfigWire:
         return result
 
     @classmethod
-    def from_dict(
-        cls, data: MutableMapping[str, Any]
-    ) -> DistributedMapS3SourceConfigWire:
+    def from_dict(cls, data: MutableMapping[str, Any]) -> DistributedMapS3SourceConfig:
         transform = data.get("Transform")
         fmt = data.get("Format")
         csv_raw = data.get("CsvFormatOptions")
@@ -742,20 +701,20 @@ class DistributedMapS3SourceConfigWire:
             bucket=data.get("Bucket", ""),
             key=data.get("Key"),
             key_prefix=data.get("KeyPrefix"),
-            transform=DistributedMapS3Transform(transform)
+            transform=DistributedMapS3SourceTransform(transform)
             if transform is not None
             else None,
             expected_bucket_owner=data.get("ExpectedBucketOwner"),
             fmt=DistributedMapSourceFormat(fmt) if fmt is not None else None,
-            csv_format_options=DistributedMapCsvFormatOptionsWire.from_dict(csv_raw)
+            csv_format_options=DistributedMapCsvFormatOptions.from_dict(csv_raw)
             if csv_raw is not None
             else None,
         )
 
 
 @dataclass(frozen=True)
-class DistributedMapReaderConfigWire:
-    """Wire representation of a reader-function distributed map source config."""
+class DistributedMapReaderFunctionSourceConfig:
+    """Represent a reader-function distributed map source config."""
 
     function_name: str
     initial_state: str | None = None
@@ -769,7 +728,7 @@ class DistributedMapReaderConfigWire:
     @classmethod
     def from_dict(
         cls, data: MutableMapping[str, Any]
-    ) -> DistributedMapReaderConfigWire:
+    ) -> DistributedMapReaderFunctionSourceConfig:
         return cls(
             function_name=data.get("FunctionName", ""),
             initial_state=data.get("InitialState"),
@@ -777,19 +736,36 @@ class DistributedMapReaderConfigWire:
 
 
 @dataclass(frozen=True)
-class DistributedMapSourceWire:
-    """Wire representation of a map run source."""
+class DistributedMapInlineSourceConfig:
+    """Represent the items an inline map run source reads from."""
+
+    items: tuple[str, ...] = ()
+
+    def to_dict(self) -> MutableMapping[str, Any]:
+        return {"Items": list(self.items)}
+
+    @classmethod
+    def from_dict(
+        cls, data: MutableMapping[str, Any]
+    ) -> DistributedMapInlineSourceConfig:
+        return cls(items=tuple(data.get("Items", ())))
+
+
+@dataclass(frozen=True)
+class DistributedMapSourceConfig:
+    """Represent a map run source."""
 
     source_type: DistributedMapSourceType
     max_items: int | None = None
-    inline_items: tuple[Any, ...] | None = None
-    s3_config: DistributedMapS3SourceConfigWire | None = None
-    reader_config: DistributedMapReaderConfigWire | None = None
+    inline_source_config: DistributedMapInlineSourceConfig | None = None
+    s3_config: DistributedMapS3SourceConfig | None = None
+    reader_config: DistributedMapReaderFunctionSourceConfig | None = None
 
     def to_dict(self) -> MutableMapping[str, Any]:
         result: MutableMapping[str, Any] = {"Type": self.source_type.value}
         if self.source_type is DistributedMapSourceType.INLINE:
-            result["InlineSourceConfig"] = {"Items": list(self.inline_items or ())}
+            inline = self.inline_source_config or DistributedMapInlineSourceConfig()
+            result["InlineSourceConfig"] = inline.to_dict()
         elif (
             self.source_type is DistributedMapSourceType.S3
             and self.s3_config is not None
@@ -805,7 +781,7 @@ class DistributedMapSourceWire:
         return result
 
     @classmethod
-    def from_dict(cls, data: MutableMapping[str, Any]) -> DistributedMapSourceWire:
+    def from_dict(cls, data: MutableMapping[str, Any]) -> DistributedMapSourceConfig:
         source_type = DistributedMapSourceType(data.get("Type", "INLINE"))
         inline_cfg = data.get("InlineSourceConfig") or {}
         s3_raw = data.get("S3SourceConfig")
@@ -813,21 +789,21 @@ class DistributedMapSourceWire:
         return cls(
             source_type=source_type,
             max_items=data.get("MaxItemsToRead"),
-            inline_items=tuple(inline_cfg.get("Items", ()))
+            inline_source_config=DistributedMapInlineSourceConfig.from_dict(inline_cfg)
             if source_type is DistributedMapSourceType.INLINE
             else None,
-            s3_config=DistributedMapS3SourceConfigWire.from_dict(s3_raw)
+            s3_config=DistributedMapS3SourceConfig.from_dict(s3_raw)
             if s3_raw is not None
             else None,
-            reader_config=DistributedMapReaderConfigWire.from_dict(reader_raw)
+            reader_config=DistributedMapReaderFunctionSourceConfig.from_dict(reader_raw)
             if reader_raw is not None
             else None,
         )
 
 
 @dataclass(frozen=True)
-class DistributedMapProcessorWire:
-    """Wire representation of a map run processor."""
+class DistributedMapProcessorConfig:
+    """Represent a map run processor."""
 
     function_name: str
     function_response_types: tuple[DistributedMapFunctionResponseType, ...] | None = (
@@ -855,7 +831,7 @@ class DistributedMapProcessorWire:
         return result
 
     @classmethod
-    def from_dict(cls, data: MutableMapping[str, Any]) -> DistributedMapProcessorWire:
+    def from_dict(cls, data: MutableMapping[str, Any]) -> DistributedMapProcessorConfig:
         response_types = data.get("FunctionResponseTypes")
         return cls(
             function_name=data.get("FunctionName", ""),
@@ -872,8 +848,8 @@ class DistributedMapProcessorWire:
 
 
 @dataclass(frozen=True)
-class DistributedMapCompletionConfigWire:
-    """Wire representation of a map run completion (failure-tolerance) config."""
+class DistributedMapCompletionConfig:
+    """Represent a map run completion (failure-tolerance) config."""
 
     tolerated_failure_count: int | None = None
     tolerated_failure_percentage: float | None = None
@@ -892,7 +868,7 @@ class DistributedMapCompletionConfigWire:
     @classmethod
     def from_dict(
         cls, data: MutableMapping[str, Any]
-    ) -> DistributedMapCompletionConfigWire:
+    ) -> DistributedMapCompletionConfig:
         return cls(
             tolerated_failure_count=data.get("ToleratedFailureCount"),
             tolerated_failure_percentage=data.get("ToleratedFailurePercentage"),
@@ -901,8 +877,8 @@ class DistributedMapCompletionConfigWire:
 
 
 @dataclass(frozen=True)
-class DistributedMapS3DestinationConfigWire:
-    """Wire representation of an S3 distributed map destination config."""
+class DistributedMapS3DestinationConfig:
+    """Represent an S3 distributed map destination config."""
 
     bucket: str
     key_prefix: str
@@ -920,7 +896,7 @@ class DistributedMapS3DestinationConfigWire:
     @classmethod
     def from_dict(
         cls, data: MutableMapping[str, Any]
-    ) -> DistributedMapS3DestinationConfigWire:
+    ) -> DistributedMapS3DestinationConfig:
         return cls(
             bucket=data.get("Bucket", ""),
             key_prefix=data.get("KeyPrefix", ""),
@@ -929,12 +905,12 @@ class DistributedMapS3DestinationConfigWire:
 
 
 @dataclass(frozen=True)
-class DistributedMapDestinationEntryWire:
-    """Wire representation of a single distributed map destination entry."""
+class _DistributedMapDestinationEntry:
+    """Hold the members the OnSuccess and OnFailure shapes have in common."""
 
     type: DistributedMapDestinationType
     include: tuple[DistributedMapDestinationInclude, ...]
-    s3_destination_config: DistributedMapS3DestinationConfigWire
+    s3_destination_config: DistributedMapS3DestinationConfig
 
     def to_dict(self) -> MutableMapping[str, Any]:
         return {
@@ -944,27 +920,33 @@ class DistributedMapDestinationEntryWire:
         }
 
     @classmethod
-    def from_dict(
-        cls, data: MutableMapping[str, Any]
-    ) -> DistributedMapDestinationEntryWire:
+    def from_dict(cls, data: MutableMapping[str, Any]) -> Self:
         s3_raw = data.get("S3DestinationConfig") or {}
         return cls(
             type=DistributedMapDestinationType(data.get("Type", "S3")),
             include=tuple(
                 DistributedMapDestinationInclude(i) for i in data.get("Include", [])
             ),
-            s3_destination_config=DistributedMapS3DestinationConfigWire.from_dict(
-                s3_raw
-            ),
+            s3_destination_config=DistributedMapS3DestinationConfig.from_dict(s3_raw),
         )
 
 
 @dataclass(frozen=True)
-class DistributedMapDestinationWire:
-    """Wire representation of a map run destination config."""
+class DistributedMapOnSuccessConfig(_DistributedMapDestinationEntry):
+    """Represent where a map run writes the outcome of its succeeded items."""
 
-    on_success: DistributedMapDestinationEntryWire | None = None
-    on_failure: DistributedMapDestinationEntryWire | None = None
+
+@dataclass(frozen=True)
+class DistributedMapOnFailureConfig(_DistributedMapDestinationEntry):
+    """Represent where a map run writes the outcome of its failed items."""
+
+
+@dataclass(frozen=True)
+class DistributedMapDestinationConfig:
+    """Represent a map run destination config."""
+
+    on_success: DistributedMapOnSuccessConfig | None = None
+    on_failure: DistributedMapOnFailureConfig | None = None
 
     def to_dict(self) -> MutableMapping[str, Any]:
         result: MutableMapping[str, Any] = {}
@@ -975,22 +957,24 @@ class DistributedMapDestinationWire:
         return result
 
     @classmethod
-    def from_dict(cls, data: MutableMapping[str, Any]) -> DistributedMapDestinationWire:
+    def from_dict(
+        cls, data: MutableMapping[str, Any]
+    ) -> DistributedMapDestinationConfig:
         success_raw = data.get("OnSuccess")
         failure_raw = data.get("OnFailure")
         return cls(
-            on_success=DistributedMapDestinationEntryWire.from_dict(success_raw)
+            on_success=DistributedMapOnSuccessConfig.from_dict(success_raw)
             if success_raw is not None
             else None,
-            on_failure=DistributedMapDestinationEntryWire.from_dict(failure_raw)
+            on_failure=DistributedMapOnFailureConfig.from_dict(failure_raw)
             if failure_raw is not None
             else None,
         )
 
 
 @dataclass(frozen=True)
-class DistributedMapResultCollectionWire:
-    """Wire representation of the map run result-collection setting."""
+class DistributedMapResultCollectionConfig:
+    """Represent the map run result-collection setting."""
 
     mode: DistributedMapResultCollectionMode
 
@@ -1000,7 +984,7 @@ class DistributedMapResultCollectionWire:
     @classmethod
     def from_dict(
         cls, data: MutableMapping[str, Any]
-    ) -> DistributedMapResultCollectionWire:
+    ) -> DistributedMapResultCollectionConfig:
         return cls(mode=DistributedMapResultCollectionMode(data.get("Mode", "NONE")))
 
 
@@ -1009,11 +993,11 @@ class DistributedMapOptions:
     """Configuration options for starting a map run."""
 
     max_concurrency: int
-    source: DistributedMapSourceWire
-    processor: DistributedMapProcessorWire
-    destination: DistributedMapDestinationWire | None = None
-    completion_config: DistributedMapCompletionConfigWire | None = None
-    result_collection: DistributedMapResultCollectionWire | None = None
+    source: DistributedMapSourceConfig
+    processor: DistributedMapProcessorConfig
+    destination: DistributedMapDestinationConfig | None = None
+    completion_config: DistributedMapCompletionConfig | None = None
+    result_collection: DistributedMapResultCollectionConfig | None = None
     timeout_seconds: int | None = None
 
     @classmethod
@@ -1025,17 +1009,15 @@ class DistributedMapOptions:
         result_collection_raw = data.get("ResultCollection")
         return cls(
             max_concurrency=data["MaxConcurrency"],
-            source=DistributedMapSourceWire.from_dict(source_raw),
-            processor=DistributedMapProcessorWire.from_dict(processor_raw),
-            destination=DistributedMapDestinationWire.from_dict(destination_raw)
+            source=DistributedMapSourceConfig.from_dict(source_raw),
+            processor=DistributedMapProcessorConfig.from_dict(processor_raw),
+            destination=DistributedMapDestinationConfig.from_dict(destination_raw)
             if destination_raw is not None
             else None,
-            completion_config=DistributedMapCompletionConfigWire.from_dict(
-                completion_raw
-            )
+            completion_config=DistributedMapCompletionConfig.from_dict(completion_raw)
             if completion_raw is not None
             else None,
-            result_collection=DistributedMapResultCollectionWire.from_dict(
+            result_collection=DistributedMapResultCollectionConfig.from_dict(
                 result_collection_raw
             )
             if result_collection_raw is not None
@@ -1635,10 +1617,6 @@ class Operation:
                 "FailureCount": self.distributed_map_details.failure_count,
                 "UnprocessedCount": self.distributed_map_details.unprocessed_count,
             }
-            if self.distributed_map_details.status is not None:
-                distributed_map_details_dict["Status"] = (
-                    self.distributed_map_details.status.value
-                )
             if self.distributed_map_details.completion_reason is not None:
                 distributed_map_details_dict["CompletionReason"] = (
                     self.distributed_map_details.completion_reason.value

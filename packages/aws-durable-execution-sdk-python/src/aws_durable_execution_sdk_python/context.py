@@ -12,6 +12,7 @@ from typing import (
     NoReturn,
     ParamSpec,
     TypeVar,
+    overload,
 )
 
 from aws_durable_execution_sdk_python.config import (
@@ -22,6 +23,7 @@ from aws_durable_execution_sdk_python.config import (
     MapConfig,
     DistributedMapConfig,
     DistributedMapProcessor,
+    DistributedMapResultConfig,
     DistributedMapSource,
     ParallelBranch,
     ParallelConfig,
@@ -29,9 +31,11 @@ from aws_durable_execution_sdk_python.config import (
     WaitForCallbackConfig,
 )
 from aws_durable_execution_sdk_python.concurrency.models import (
+    envelope_summary_generator,
+)
+from aws_durable_execution_sdk_python.dmap.models import (
     DistributedMapResult,
     DistributedMapSummary,
-    envelope_summary_generator,
 )
 from aws_durable_execution_sdk_python.exceptions import (
     CallbackError,
@@ -109,6 +113,8 @@ Params = ParamSpec("Params")
 logger = logging.getLogger(__name__)
 
 PASS_THROUGH_SERDES: SerDes[Any] = PassThroughSerDes()
+
+_MAX_CONCURRENCY_LIMIT = 10000
 
 
 @dataclass(frozen=True)
@@ -691,14 +697,37 @@ class DurableContext(DurableContextProtocol):
             )
             return executor.process()
 
+    @overload
     def distributed_map(
         self,
         source: DistributedMapSource | Sequence[Any],
         processor: DistributedMapProcessor,
         max_concurrency: int,
         name: str | None = None,
+        *,
+        config: DistributedMapResultConfig,
+    ) -> DistributedMapResult: ...
+
+    @overload
+    def distributed_map(
+        self,
+        source: DistributedMapSource | Sequence[Any],
+        processor: DistributedMapProcessor,
+        max_concurrency: int,
+        name: str | None = None,
+        *,
         config: DistributedMapConfig | None = None,
-    ) -> DistributedMapSummary | DistributedMapResult:
+    ) -> DistributedMapSummary: ...
+
+    def distributed_map(
+        self,
+        source: DistributedMapSource | Sequence[Any],
+        processor: DistributedMapProcessor,
+        max_concurrency: int,
+        name: str | None = None,
+        *,
+        config: DistributedMapConfig | None = None,
+    ) -> DistributedMapSummary:
         """Start a distributed map run and resolve with its summary.
 
         Args:
@@ -709,29 +738,29 @@ class DurableContext(DurableContextProtocol):
             config: Optional run-level configuration
 
         Returns:
-            The map run's summary, or a DistributedMapResult when config.collect_results is set
+            The map run's summary, or a DistributedMapResult when a
+            DistributedMapResultConfig is passed
         """
         if not isinstance(source, (DistributedMapSource, list, tuple)):
             msg = "source must be a DistributedMapSource or a list/tuple of items"
             raise ValidationError(msg)
-        if max_concurrency <= 0:
-            msg = "max_concurrency must be greater than zero"
+        if not 1 <= max_concurrency <= _MAX_CONCURRENCY_LIMIT:
+            msg = (
+                f"max_concurrency must be between 1 and {_MAX_CONCURRENCY_LIMIT}, "
+                f"got: {max_concurrency}"
+            )
             raise ValidationError(msg)
         if config is None:
             config = DistributedMapConfig()
-        with self._replay_aware():
-            operation_id = self._create_step_id()
+        with self._operation_replay_aware(
+            OperationSubType.DISTRIBUTED_MAP, name
+        ) as operation_identifier:
             executor: DistributedMapOperationExecutor = DistributedMapOperationExecutor(
                 source=source,
                 processor=processor,
                 max_concurrency=max_concurrency,
                 state=self.state,
-                operation_identifier=OperationIdentifier(
-                    operation_id=operation_id,
-                    sub_type=OperationSubType.DISTRIBUTED_MAP,
-                    parent_id=self._parent_id,
-                    name=name,
-                ),
+                operation_identifier=operation_identifier,
                 config=config,
             )
             return executor.process()

@@ -12,9 +12,9 @@ import json
 from typing import Any
 from unittest.mock import Mock, patch
 
-from aws_durable_execution_sdk_python.concurrency.models import DistributedMapResult
+from aws_durable_execution_sdk_python.dmap.models import DistributedMapResult
 from aws_durable_execution_sdk_python.config import (
-    DistributedMapConfig,
+    DistributedMapResultConfig,
     DistributedMapProcessor,
 )
 from aws_durable_execution_sdk_python.context import DurableContext
@@ -84,8 +84,8 @@ def _replay_event(distributed_map_details: dict):
                 {
                     "Id": distributed_map_id,
                     "Type": "DISTRIBUTED_MAP",
+                    "SubType": "DistributedMap",
                     "Status": "SUCCEEDED",
-                    "ParentId": "execution-1",
                     "DistributedMapDetails": distributed_map_details,
                 },
             ],
@@ -145,7 +145,7 @@ def test_map_run_suspends_then_resumes_with_summary():
     def handler(event, context: DurableContext) -> dict[str, Any]:
         summary = context.distributed_map(
             ["a", "b"],
-            DistributedMapProcessor.report_batch_outcome("proc"),
+            DistributedMapProcessor.batch("proc"),
             max_concurrency=2,
         )
         return {
@@ -168,7 +168,7 @@ def test_map_run_suspends_then_resumes_with_summary():
             "FailureCount": 0,
             "UnprocessedCount": 0,
             "TotalCount": 2,
-            "DistributedMapRunArn": "arn:aws:lambda:us-east-1:123456789012:map-run:abc",
+            "DistributedMapRunArn": "arn:aws:lambda:us-east-1:123456789012:function:fn:$LATEST/durable-execution/exec1/invoke1/distributed-map-run/abc",
         }
     )
     replay = _run(handler, replay_event)
@@ -187,9 +187,9 @@ def test_map_run_collect_results_returns_items():
     def handler(event, context: DurableContext) -> dict[str, Any]:
         result = context.distributed_map(
             ["a", "b"],
-            DistributedMapProcessor.report_item_results("proc"),
+            DistributedMapProcessor.item_results("proc"),
             max_concurrency=2,
-            config=DistributedMapConfig(collect_results=True),
+            config=DistributedMapResultConfig(),
         )
         assert isinstance(result, DistributedMapResult)
         return {
@@ -206,7 +206,7 @@ def test_map_run_collect_results_returns_items():
             "UnprocessedCount": 0,
             "TotalCount": 2,
             "Results": [
-                {"ItemId": "0", "Status": "SUCCEEDED", "Output": 5},
+                {"ItemId": "0", "Status": "SUCCEEDED", "Output": "5"},
                 {
                     "ItemId": "1",
                     "Status": "FAILED",
@@ -226,7 +226,7 @@ def test_map_run_throw_if_error_fails_execution():
     def handler(event, context: DurableContext) -> dict[str, Any]:
         summary = context.distributed_map(
             ["a"],
-            DistributedMapProcessor.report_batch_outcome("proc"),
+            DistributedMapProcessor.batch("proc"),
             max_concurrency=1,
         )
         summary.throw_if_error()

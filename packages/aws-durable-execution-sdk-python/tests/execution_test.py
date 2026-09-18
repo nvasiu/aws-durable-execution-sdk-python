@@ -2006,18 +2006,19 @@ def test_durable_execution_with_non_durable_payload_raises_error():
     lambda_context.tenant_id = None
 
     # WHEN the handler is invoked with a non-durable payload
-    # THEN it returns a FAILED durable envelope carrying the real cause
-    #      (rather than raising, so the backend surfaces it instead of a null Status)
-    result = test_handler(regular_event, lambda_context)
-    assert result["Status"] == InvocationStatus.FAILED.value
-    assert (
-        "Unexpected payload provided to start the durable execution."
-        in result["Error"]["ErrorMessage"]
-    )
+    # THEN it raises a ValueError with a helpful message
+    with pytest.raises(
+        ExecutionError,
+        match=(
+            "Unexpected payload provided to start the durable execution. "
+            "Check your resource configurations to confirm the durability is set."
+        ),
+    ):
+        test_handler(regular_event, lambda_context)
 
 
 def test_durable_execution_with_non_dict_event_raises_error():
-    """Test that invoking a durable function with a non-dict event returns a FAILED envelope."""
+    """Test that invoking a durable function with a non-dict event raises a helpful error."""
 
     # GIVEN a durable function
     @durable_execution
@@ -2036,13 +2037,15 @@ def test_durable_execution_with_non_dict_event_raises_error():
     lambda_context.tenant_id = None
 
     # WHEN the handler is invoked with a non-dict event
-    # THEN it returns a FAILED durable envelope carrying the real cause
-    result = test_handler(non_dict_event, lambda_context)
-    assert result["Status"] == InvocationStatus.FAILED.value
-    assert (
-        "Unexpected payload provided to start the durable execution."
-        in result["Error"]["ErrorMessage"]
-    )
+    # THEN it raises a ValueError with a helpful message
+    with pytest.raises(
+        ExecutionError,
+        match=(
+            "Unexpected payload provided to start the durable execution. "
+            "Check your resource configurations to confirm the durability is set."
+        ),
+    ):
+        test_handler(non_dict_event, lambda_context)
 
 
 # =============================================================================
