@@ -22,6 +22,15 @@ from aws_durable_execution_sdk_python.waits import (
     WaitForConditionConfig,
     WaitForConditionDecision,
 )
+from aws_durable_execution_sdk_python.config import (
+    DistributedMapCompletionConfig,
+    DistributedMapConfig,
+    S3Destination,
+    S3Source,
+    DistributedMapProcessor,
+    DistributedMapSource,
+    ReaderSourceConfig,
+)
 
 
 def test_completion_config_defaults():
@@ -279,3 +288,165 @@ def test_completion_decision_rejects_outcome_when_not_complete():
 
 
 # endregion Config validation
+
+
+# ==========================================================================
+# Distributed map config validation
+# ==========================================================================
+
+
+def test_retry_duration_out_of_range_rejected():
+    with pytest.raises(ValidationError, match="between 1 minute and 6 hours"):
+        DistributedMapProcessor.batch("p", max_retry_duration=Duration.from_seconds(30))
+    with pytest.raises(ValidationError, match="between 1 minute and 6 hours"):
+        DistributedMapProcessor.batch("p", max_retry_duration=Duration.from_hours(7))
+
+
+def test_expected_bucket_owner_must_be_12_digits():
+    with pytest.raises(ValidationError, match="12-digit"):
+        S3Source.json_lines("s3://b/k.jsonl", expected_bucket_owner="123")
+
+
+def test_csv_delimiter_invalid_string_rejected():
+    with pytest.raises(ValidationError, match="delimiter must be one of"):
+        S3Source.csv("s3://b/data.csv", delimiter="BAR")
+
+
+def test_csv_headers_duplicates_rejected():
+    with pytest.raises(ValidationError, match="duplicates"):
+        S3Source.csv("s3://b/k.csv", headers=["a", "a"])
+
+
+def test_json_lines_requires_key():
+    with pytest.raises(ValidationError, match="object key"):
+        S3Source.json_lines("s3://bucket-only")
+
+
+def test_timeout_out_of_range_rejected():
+    with pytest.raises(ValidationError, match="at most 90 days"):
+        DistributedMapConfig(timeout=Duration.from_days(91))
+
+
+def test_empty_function_name_rejected():
+    with pytest.raises(ValidationError, match="non-empty"):
+        DistributedMapProcessor.batch("")
+
+
+def test_valid_function_references_accepted():
+    for ref in (
+        "my-func",
+        "my-func:PROD",
+        "123456789012:function:my-func",
+        "arn:aws:lambda:us-east-1:123456789012:function:my-func",
+        "arn:aws:lambda:us-east-1:123456789012:function:my-func:1",
+    ):
+        # Should not raise.
+        DistributedMapProcessor.batch(ref)
+
+
+def test_function_name_over_max_length_rejected():
+    with pytest.raises(ValidationError, match="at most 170 characters"):
+        DistributedMapProcessor.batch("f" * 171)
+
+
+def test_completion_count_and_percentage_mutually_exclusive():
+    with pytest.raises(ValidationError, match="mutually exclusive"):
+        DistributedMapCompletionConfig(
+            tolerated_failure_count=1, tolerated_failure_percentage=5
+        )
+
+
+def test_completion_sample_size_requires_percentage():
+    with pytest.raises(ValidationError, match="minimum_sample_size"):
+        DistributedMapCompletionConfig(minimum_sample_size=10)
+
+
+def test_completion_negative_count_rejected():
+    with pytest.raises(ValidationError, match="non-negative"):
+        DistributedMapCompletionConfig(tolerated_failure_count=-1)
+
+
+def test_completion_percentage_out_of_range_rejected():
+    with pytest.raises(ValidationError, match="between 0 and 100"):
+        DistributedMapCompletionConfig(tolerated_failure_percentage=150)
+
+
+def test_completion_sample_size_below_one_rejected():
+    with pytest.raises(ValidationError, match="at least 1"):
+        DistributedMapCompletionConfig(
+            tolerated_failure_percentage=5, minimum_sample_size=0
+        )
+
+
+def test_completion_failure_count_factory():
+    assert DistributedMapCompletionConfig.failure_count(3).tolerated_failure_count == 3
+
+
+def test_retry_duration_below_minimum_rejected():
+    with pytest.raises(ValidationError, match="1 minute and 6 hours"):
+        DistributedMapProcessor.batch("p", max_retry_duration=Duration.from_seconds(30))
+
+
+def test_max_items_below_one_rejected():
+    with pytest.raises(ValidationError, match="at least 1"):
+        S3Source.json_lines("s3://b/k.jsonl", max_items=0)
+
+
+def test_csv_requires_object_key():
+    with pytest.raises(ValidationError, match="csv requires an S3 object key"):
+        S3Source.csv("s3://bucket")
+
+
+def test_source_without_any_kind_rejected():
+    with pytest.raises(ValidationError, match="exactly one of"):
+        DistributedMapSource()
+
+
+def test_source_with_two_kinds_rejected():
+    with pytest.raises(ValidationError, match="exactly one of"):
+        DistributedMapSource(
+            inline_items=("a",),
+            reader=ReaderSourceConfig(function_name="r"),
+        )
+
+
+def test_success_destination_all_false_rejected():
+    with pytest.raises(ValidationError, match="success destination must include"):
+        S3Destination.successes(
+            "s3://out/ok", include_input=False, include_output=False
+        )
+
+
+def test_failure_destination_all_false_rejected():
+    with pytest.raises(ValidationError, match="failure destination must include"):
+        S3Destination.failures("s3://out/bad", include_input=False, include_error=False)
+
+
+def test_invalid_s3_uri_rejected():
+    with pytest.raises(ValidationError, match="Invalid S3 URI"):
+        S3Source.json_lines("s3:///key.jsonl")
+
+
+def test_non_s3_scheme_uri_rejected():
+    with pytest.raises(ValidationError, match="must start with s3://"):
+        S3Source.json_lines("http://foo/bar")
+
+
+def test_csv_empty_headers_rejected():
+    with pytest.raises(ValidationError, match="must be non-empty"):
+        S3Source.csv("s3://b/f.csv", headers=[])
+
+
+def test_negative_retry_attempts_rejected():
+    with pytest.raises(ValidationError, match="non-negative"):
+        DistributedMapProcessor.batch("p", max_retry_attempts=-5)
+
+
+def test_batch_size_out_of_range_rejected():
+    with pytest.raises(ValidationError, match="between 1 and 10000"):
+        DistributedMapProcessor.batch("p", batch_size=0)
+
+
+def test_durable_execution_name_prefix_too_long_rejected():
+    with pytest.raises(ValidationError, match="1 to 36 characters"):
+        DistributedMapProcessor.batch("p", durable_execution_name_prefix="x" * 37)
