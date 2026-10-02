@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 from unittest.mock import Mock, patch
 
+from aws_durable_execution_sdk_python.config import ProcessorResponseMode
 from aws_durable_execution_sdk_python.dmap.handlers import (
     durable_distributed_map_batch_handler,
     durable_distributed_map_item_handler,
@@ -138,7 +139,7 @@ def test_durable_batch_handler_returns_value():
 
 def test_durable_item_handler_failures_form():
     handler = durable_distributed_map_item_handler(
-        lambda _ctx, item: item, report="failures"
+        lambda _ctx, item: item, response_mode=ProcessorResponseMode.ITEM_FAILURES
     )
     result = _run(handler, [{"itemId": "0", "body": "1"}])
     assert result["Status"] == InvocationStatus.SUCCEEDED.value

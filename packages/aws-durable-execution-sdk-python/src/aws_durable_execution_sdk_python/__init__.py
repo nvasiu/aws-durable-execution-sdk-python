@@ -20,6 +20,7 @@ from aws_durable_execution_sdk_python.config import (
     DistributedMapItemStatus,
     DistributedMapStatus,
     ParallelBranch,
+    ProcessorResponseMode,
     complete_batch,
     continue_batch,
 )
@@ -101,6 +102,7 @@ __all__ = [
     "InvocationError",
     "InvokeError",
     "ParallelBranch",
+    "ProcessorResponseMode",
     "PluginLoadError",
     "RetryableSerDesError",
     "SerDesError",
