@@ -4,14 +4,11 @@ from __future__ import annotations
 
 import threading
 import time
-from unittest.mock import MagicMock
 
 import pytest
 
 from aws_durable_execution_sdk_python.config import (
-    DistributedMapConfig,
-    DistributedMapProcessor,
-    DistributedMapStatus,
+    ProcessorResponseMode,
 )
 from aws_durable_execution_sdk_python.dmap.handlers import (
     ReaderPage,
@@ -20,85 +17,21 @@ from aws_durable_execution_sdk_python.dmap.handlers import (
     durable_distributed_map_item_handler,
     distributed_map_reader,
 )
-from aws_durable_execution_sdk_python.exceptions import ExecutionError, ValidationError
-from aws_durable_execution_sdk_python.lambda_service import (
-    DistributedMapCompletionReason,
-    DistributedMapDetails,
-    Operation,
-    OperationStatus,
-    OperationType,
-)
-from aws_durable_execution_sdk_python.operation.dmap import (
-    DistributedMapOperationExecutor,
-    _distributed_map_status_from_operation,
-)
+from aws_durable_execution_sdk_python.exceptions import ValidationError
 
 
-def _terminal_operation(
-    status: OperationStatus, details: DistributedMapDetails
-) -> Operation:
-    return Operation(
-        operation_id="dmap-id",
-        operation_type=OperationType.DISTRIBUTED_MAP,
-        status=status,
-        distributed_map_details=details,
-    )
+def test_item_handler_rejects_batch_response_mode():
+    with pytest.raises(ValidationError, match="response_mode must be"):
+        distributed_map_item_handler(
+            lambda x: x, response_mode=ProcessorResponseMode.BATCH
+        )
 
 
-def test_status_derived_from_operation_when_details_omit_status():
-    """Status comes from the operation, not from details."""
-    details = DistributedMapDetails(
-        completion_reason=DistributedMapCompletionReason.ALL_COMPLETED,
-        success_count=3,
-        total_count=3,
-    )
-    op = _terminal_operation(OperationStatus.SUCCEEDED, details)
-    assert _distributed_map_status_from_operation(op) is DistributedMapStatus.SUCCEEDED
-
-
-def test_status_from_operation_rejects_non_terminal():
-    """A non-terminal operation status cannot map to a DistributedMapStatus."""
-    op = _terminal_operation(
-        OperationStatus.STARTED,
-        DistributedMapDetails(success_count=0),
-    )
-    with pytest.raises(ExecutionError, match="Cannot derive distributed map status"):
-        _distributed_map_status_from_operation(op)
-
-
-def test_resolved_summary_uses_operation_status_not_details():
-    """_resolve_summary carries the derived status when details omit it."""
-    details = DistributedMapDetails(
-        completion_reason=DistributedMapCompletionReason.ALL_COMPLETED,
-        success_count=2,
-        failure_count=0,
-        unprocessed_count=0,
-        total_count=2,
-    )
-    executor = DistributedMapOperationExecutor(
-        source=["a", "b"],
-        processor=DistributedMapProcessor.batch("proc"),
-        max_concurrency=1,
-        state=MagicMock(),
-        operation_identifier=MagicMock(),
-        config=DistributedMapConfig(),
-    )
-    summary = executor._resolve_summary(
-        _terminal_operation(OperationStatus.SUCCEEDED, details)
-    )
-    assert summary.status is DistributedMapStatus.SUCCEEDED
-    assert summary.completion_reason is DistributedMapCompletionReason.ALL_COMPLETED
-    assert summary.success_count == 2
-
-
-def test_item_handler_invalid_report_rejected():
-    with pytest.raises(ValidationError, match="report must be"):
-        distributed_map_item_handler(lambda x: x, report="bogus")
-
-
-def test_durable_item_handler_invalid_report_rejected():
-    with pytest.raises(ValidationError, match="report must be"):
-        durable_distributed_map_item_handler(lambda _ctx, item: item, report="bogus")
+def test_durable_item_handler_rejects_batch_response_mode():
+    with pytest.raises(ValidationError, match="response_mode must be"):
+        durable_distributed_map_item_handler(
+            lambda _ctx, item: item, response_mode=ProcessorResponseMode.BATCH
+        )
 
 
 def test_item_handler_rejects_concurrency_below_one():
@@ -106,6 +39,13 @@ def test_item_handler_rejects_concurrency_below_one():
         distributed_map_item_handler(lambda x: x, concurrency=0)
     with pytest.raises(ValidationError, match="concurrency must be at least 1"):
         distributed_map_item_handler(lambda x: x, concurrency=-1)
+
+
+def test_durable_item_handler_rejects_concurrency_below_one():
+    with pytest.raises(ValidationError, match="concurrency must be at least 1"):
+        durable_distributed_map_item_handler(lambda _ctx, item: item, concurrency=0)
+    with pytest.raises(ValidationError, match="concurrency must be at least 1"):
+        durable_distributed_map_item_handler(lambda _ctx, item: item, concurrency=-1)
 
 
 def test_item_handler_runs_items_one_at_a_time_by_default():
@@ -186,7 +126,9 @@ def test_item_handler_captures_failures():
 
 
 def test_item_handler_failures_form_reports_only_failures():
-    handler = distributed_map_item_handler(lambda x: x, report="failures")
+    handler = distributed_map_item_handler(
+        lambda x: x, response_mode=ProcessorResponseMode.ITEM_FAILURES
+    )
     resp = handler({"records": [{"itemId": "0", "body": "1"}]})
     assert resp == {"batchItemFailures": []}
 
@@ -212,33 +154,41 @@ def test_batch_handler_success_and_propagates_error():
 
 
 def test_reader_returns_items_and_next_state_then_exhausts():
-    def read(state):
+    def read(state, max_items_per_page):
         if state is None:
-            return ReaderPage(items=[1, 2], next_state={"page": 1})
+            return ReaderPage(items=[1, 2][:max_items_per_page], next_state={"page": 1})
         return ReaderPage(items=[3])
 
     handler = distributed_map_reader(read)
-    first = handler({"state": None, "maxItems": 10})
+    first = handler({"state": None, "maxItemsPerPage": 10})
     assert first["items"] == [1, 2]
     assert first["nextState"] == '{"page": 1}'
 
-    second = handler({"state": '{"page": 1}', "maxItems": 10})
+    second = handler({"state": '{"page": 1}', "maxItemsPerPage": 10})
     assert second["items"] == [3]
     assert "nextState" not in second
 
 
-def test_reader_rejects_page_over_max_items():
-    handler = distributed_map_reader(lambda _s: ReaderPage(items=[1, 2, 3]))
-    with pytest.raises(ValidationError, match="exceeding maxItems"):
-        handler({"state": None, "maxItems": 2})
+def test_reader_receives_the_page_bound():
+    """The page bound reaches func, so a reader can page to it."""
+    handler = distributed_map_reader(
+        lambda _s, max_items_per_page: ReaderPage(items=list(range(max_items_per_page)))
+    )
+    assert handler({"state": None, "maxItemsPerPage": 3})["items"] == [0, 1, 2]
+
+
+def test_reader_rejects_page_over_max_items_per_page():
+    handler = distributed_map_reader(lambda _s, _max: ReaderPage(items=[1, 2, 3]))
+    with pytest.raises(ValidationError, match="exceeding maxItemsPerPage"):
+        handler({"state": None, "maxItemsPerPage": 2})
 
 
 def test_reader_rejects_oversized_next_state():
     handler = distributed_map_reader(
-        lambda _s: ReaderPage(items=[1], next_state="x" * 40_000)
+        lambda _s, _max: ReaderPage(items=[1], next_state="x" * 40_000)
     )
     with pytest.raises(ValidationError, match="32 KB limit"):
-        handler({"state": None, "maxItems": 10})
+        handler({"state": None, "maxItemsPerPage": 10})
 
 
 def test_item_handler_rejects_non_processor_envelope():
@@ -248,6 +198,6 @@ def test_item_handler_rejects_non_processor_envelope():
 
 
 def test_reader_rejects_non_reader_envelope():
-    handler = distributed_map_reader(lambda _state: ReaderPage(items=[]))
+    handler = distributed_map_reader(lambda _state, _max: ReaderPage(items=[]))
     with pytest.raises(ValidationError, match="reader envelope"):
         handler({"state": None})

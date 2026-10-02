@@ -115,6 +115,8 @@ def _tracking_checkpoint():
                 Operation(
                     operation_id=update.operation_id,
                     operation_type=update.operation_type,
+                    sub_type=update.sub_type,
+                    name=update.name,
                     status=OperationStatus.STARTED,
                     parent_id=update.parent_id,
                 )
@@ -162,7 +164,6 @@ def test_map_run_suspends_then_resumes_with_summary():
     # Replay with the run completed.
     _map_run_id, replay_event = _replay_event(
         {
-            "Status": "SUCCEEDED",
             "CompletionReason": "ALL_COMPLETED",
             "SuccessCount": 2,
             "FailureCount": 0,
@@ -199,7 +200,6 @@ def test_map_run_result_config_returns_items():
 
     _map_run_id, replay_event = _replay_event(
         {
-            "Status": "SUCCEEDED",
             "CompletionReason": "ALL_COMPLETED",
             "SuccessCount": 1,
             "FailureCount": 1,
@@ -234,7 +234,6 @@ def test_map_run_throw_if_error_fails_execution():
 
     _map_run_id, replay_event = _replay_event(
         {
-            "Status": "FAILED",
             "CompletionReason": "FAILURE_TOLERANCE_EXCEEDED",
             "SuccessCount": 0,
             "FailureCount": 1,

@@ -11,10 +11,14 @@ import functools
 from collections.abc import MutableMapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Callable, Literal
+from typing import Any, Callable
 
-from aws_durable_execution_sdk_python.concurrency.models import BatchItemStatus
-from aws_durable_execution_sdk_python.config import CompletionConfig, MapConfig
+from aws_durable_execution_sdk_python.config import (
+    BatchItemStatus,
+    CompletionConfig,
+    MapConfig,
+    ProcessorResponseMode,
+)
 from aws_durable_execution_sdk_python.exceptions import ValidationError
 from aws_durable_execution_sdk_python.execution import durable_execution
 from aws_durable_execution_sdk_python.serdes import (
@@ -53,7 +57,7 @@ class ProcessorRecord:
 class ProcessorEvent:
     """The event a processor function is invoked with, one batch of items."""
 
-    records: tuple[ProcessorRecord, ...] = ()
+    records: list[ProcessorRecord] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: MutableMapping[str, Any]) -> ProcessorEvent:
@@ -61,7 +65,7 @@ class ProcessorEvent:
         if not isinstance(records, list):
             msg = "expected a distributed map processor envelope with a 'records' list"
             raise ValidationError(msg)
-        return cls(records=tuple(ProcessorRecord.from_dict(r) for r in records))
+        return cls(records=[ProcessorRecord.from_dict(r) for r in records])
 
     def to_dict(self) -> MutableMapping[str, Any]:
         return {"records": [record.to_dict() for record in self.records]}
@@ -123,17 +127,17 @@ class ItemFailure:
 class ItemHandlerResponse:
     """What an item handler returns. A None ``results`` reports failures only."""
 
-    failures: tuple[ItemFailure, ...] = ()
-    results: tuple[ItemResult, ...] | None = None
+    failures: list[ItemFailure] = field(default_factory=list)
+    results: list[ItemResult] | None = None
 
     @classmethod
     def from_dict(cls, data: MutableMapping[str, Any]) -> ItemHandlerResponse:
         results = data.get("batchItemResults")
         return cls(
-            failures=tuple(
+            failures=[
                 ItemFailure.from_dict(f) for f in data.get("batchItemFailures", [])
-            ),
-            results=tuple(ItemResult.from_dict(r) for r in results)
+            ],
+            results=[ItemResult.from_dict(r) for r in results]
             if results is not None
             else None,
         )
@@ -151,21 +155,22 @@ class ItemHandlerResponse:
 class ReaderEvent:
     """The event a reader function is invoked with."""
 
-    max_items: int
+    max_items_per_page: int
     state: str | None = None
 
     @classmethod
     def from_dict(cls, data: MutableMapping[str, Any]) -> ReaderEvent:
-        max_items = data.get("maxItems")
-        if not isinstance(max_items, int):
+        max_items_per_page = data.get("maxItemsPerPage")
+        if not isinstance(max_items_per_page, int):
             msg = (
-                "expected a distributed map reader envelope with an integer 'maxItems'"
+                "expected a distributed map reader envelope with an integer "
+                "'maxItemsPerPage'"
             )
             raise ValidationError(msg)
-        return cls(max_items=max_items, state=data.get("state"))
+        return cls(max_items_per_page=max_items_per_page, state=data.get("state"))
 
     def to_dict(self) -> MutableMapping[str, Any]:
-        result: MutableMapping[str, Any] = {"maxItems": self.max_items}
+        result: MutableMapping[str, Any] = {"maxItemsPerPage": self.max_items_per_page}
         if self.state is not None:
             result["state"] = self.state
         return result
@@ -175,15 +180,15 @@ class ReaderEvent:
 class ReaderResponse:
     """What a reader function returns. A None ``next_state`` exhausts the source."""
 
-    items: tuple[Any, ...] = ()
+    items: list[Any] = field(default_factory=list)
     next_state: str | None = None
 
     @classmethod
     def from_dict(cls, data: MutableMapping[str, Any]) -> ReaderResponse:
-        return cls(items=tuple(data.get("items", ())), next_state=data.get("nextState"))
+        return cls(items=list(data.get("items", [])), next_state=data.get("nextState"))
 
     def to_dict(self) -> MutableMapping[str, Any]:
-        result: MutableMapping[str, Any] = {"items": list(self.items)}
+        result: MutableMapping[str, Any] = {"items": self.items}
         if self.next_state is not None:
             result["nextState"] = self.next_state
         return result
@@ -199,9 +204,12 @@ def _to_output(serdes: SerDes[Any], value: Any, ctx: SerDesContext) -> str:
     return serdes.serialize(value, ctx)
 
 
-def _validate_report(report: str) -> None:
-    if report not in ("results", "failures"):
-        msg = f"report must be 'results' or 'failures', got: {report!r}"
+def _validate_response_mode(response_mode: ProcessorResponseMode) -> None:
+    if response_mode is ProcessorResponseMode.BATCH:
+        msg = (
+            "response_mode must be ProcessorResponseMode.ITEM_RESULTS or "
+            "ProcessorResponseMode.ITEM_FAILURES, got: BATCH"
+        )
         raise ValidationError(msg)
 
 
@@ -217,13 +225,14 @@ def distributed_map_item_handler(
     item_serdes: SerDes[Any] | None = None,
     result_serdes: SerDes[Any] | None = None,
     concurrency: int = 1,
-    report: Literal["results", "failures"] = "results",
+    response_mode: ProcessorResponseMode = ProcessorResponseMode.ITEM_RESULTS,
 ) -> Callable[..., Any]:
     """Wrap a Lambda to be used as an item_results processor.
 
-    Pass ``report="failures"`` for an item_failures processor. ``func``
-    takes one item and returns its output or raises. The decorated name becomes
-    the Lambda handler and takes ``(event, context)``, so name it ``handler``.
+    Pass ``response_mode=ProcessorResponseMode.ITEM_FAILURES`` for an
+    item_failures processor. ``func`` takes one item and returns its output or
+    raises. The decorated name becomes the Lambda handler and takes
+    ``(event, context)``, so name it ``handler``.
 
     Items in a batch are processed one at a time. Raise ``concurrency`` to run
     that many items at once, which requires ``func`` to be safe to call from
@@ -235,9 +244,9 @@ def distributed_map_item_handler(
             item_serdes=item_serdes,
             result_serdes=result_serdes,
             concurrency=concurrency,
-            report=report,
+            response_mode=response_mode,
         )
-    _validate_report(report)
+    _validate_response_mode(response_mode)
     _validate_concurrency(concurrency)
     serdes = item_serdes or DEFAULT_JSON_SERDES
     out_serdes = result_serdes or DEFAULT_JSON_SERDES
@@ -265,7 +274,7 @@ def distributed_map_item_handler(
             err = errors[i]
             if err is not None:
                 failures.append(ItemFailure.from_exception(record.item_id, err))
-            elif report == "results":
+            elif response_mode is ProcessorResponseMode.ITEM_RESULTS:
                 results.append(
                     ItemResult(
                         item_identifier=record.item_id,
@@ -274,8 +283,10 @@ def distributed_map_item_handler(
                 )
 
         response = ItemHandlerResponse(
-            failures=tuple(failures),
-            results=tuple(results) if report == "results" else None,
+            failures=failures,
+            results=results
+            if response_mode is ProcessorResponseMode.ITEM_RESULTS
+            else None,
         )
         return dict(response.to_dict())
 
@@ -310,15 +321,16 @@ def distributed_map_batch_handler(
 
 
 def distributed_map_reader(
-    func: Callable[[Any], ReaderPage] | None = None,
+    func: Callable[[Any, int], ReaderPage] | None = None,
     *,
     state_serdes: SerDes[Any] | None = None,
 ) -> Callable[..., Any]:
     """Wrap a Lambda to be used as a reader source.
 
-    ``func`` takes the current state and returns a ReaderPage. A ``next_state``
-    of ``None`` signals the source is exhausted. The decorated name becomes the
-    Lambda handler and takes ``(event, context)``, so name it ``handler``.
+    ``func`` takes the current state and the maximum items this page may
+    return, and returns a ReaderPage. A ``next_state`` of ``None`` signals the
+    source is exhausted. The decorated name becomes the Lambda handler and
+    takes ``(event, context)``, so name it ``handler``.
     """
     if func is None:
         return functools.partial(distributed_map_reader, state_serdes=state_serdes)
@@ -333,11 +345,11 @@ def distributed_map_reader(
             else None
         )
 
-        page = func(state)
-        if len(page.items) > reader_event.max_items:
+        page = func(state, reader_event.max_items_per_page)
+        if len(page.items) > reader_event.max_items_per_page:
             msg = (
-                f"reader returned {len(page.items)} items, exceeding maxItems "
-                f"{reader_event.max_items}"
+                f"reader returned {len(page.items)} items, exceeding "
+                f"maxItemsPerPage {reader_event.max_items_per_page}"
             )
             raise ValidationError(msg)
 
@@ -348,9 +360,7 @@ def distributed_map_reader(
                 msg = f"reader next_state exceeds the {_READER_STATE_LIMIT // 1024} KB limit"
                 raise ValidationError(msg)
 
-        return dict(
-            ReaderResponse(items=tuple(page.items), next_state=next_state).to_dict()
-        )
+        return dict(ReaderResponse(items=page.items, next_state=next_state).to_dict())
 
     return handler
 
@@ -360,21 +370,27 @@ def durable_distributed_map_item_handler(
     *,
     item_serdes: SerDes[Any] | None = None,
     result_serdes: SerDes[Any] | None = None,
-    report: Literal["results", "failures"] = "results",
+    concurrency: int = 1,
+    response_mode: ProcessorResponseMode = ProcessorResponseMode.ITEM_RESULTS,
 ) -> Callable[..., Any]:
     """Durable variant of the item handler. ``func`` receives (context, item).
 
     The Lambda must be deployed as a durable function. The decorated name becomes
     the Lambda handler and takes ``(event, context)``, so name it ``handler``.
+
+    Items in a batch are processed one at a time. Raise ``concurrency`` to run
+    that many items at once.
     """
     if func is None:
         return functools.partial(
             durable_distributed_map_item_handler,
             item_serdes=item_serdes,
             result_serdes=result_serdes,
-            report=report,
+            concurrency=concurrency,
+            response_mode=response_mode,
         )
-    _validate_report(report)
+    _validate_response_mode(response_mode)
+    _validate_concurrency(concurrency)
     serdes = item_serdes or DEFAULT_JSON_SERDES
     out_serdes = result_serdes or DEFAULT_JSON_SERDES
 
@@ -389,7 +405,10 @@ def durable_distributed_map_item_handler(
         batch = context.map(
             [record.body for record in records],
             per_item,
-            config=MapConfig(completion_config=CompletionConfig.all_completed()),
+            config=MapConfig(
+                max_concurrency=concurrency,
+                completion_config=CompletionConfig.all_completed(),
+            ),
         )
 
         results: list[ItemResult] = []
@@ -397,7 +416,7 @@ def durable_distributed_map_item_handler(
         for bi in batch.all:
             item_id = records[bi.index].item_id
             if bi.status is BatchItemStatus.SUCCEEDED:
-                if report == "results":
+                if response_mode is ProcessorResponseMode.ITEM_RESULTS:
                     results.append(
                         ItemResult(
                             item_identifier=item_id,
@@ -415,8 +434,10 @@ def durable_distributed_map_item_handler(
                 )
 
         response = ItemHandlerResponse(
-            failures=tuple(failures),
-            results=tuple(results) if report == "results" else None,
+            failures=failures,
+            results=results
+            if response_mode is ProcessorResponseMode.ITEM_RESULTS
+            else None,
         )
         return dict(response.to_dict())
 

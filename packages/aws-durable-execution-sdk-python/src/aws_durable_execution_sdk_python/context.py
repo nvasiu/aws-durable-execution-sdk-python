@@ -52,6 +52,7 @@ from aws_durable_execution_sdk_python.identifier import (
     OperationIdNamespace,
 )
 from aws_durable_execution_sdk_python.lambda_service import (
+    _MAX_CONCURRENCY_LIMIT,
     OperationSubType,
     OperationType,
 )
@@ -113,8 +114,6 @@ Params = ParamSpec("Params")
 logger = logging.getLogger(__name__)
 
 PASS_THROUGH_SERDES: SerDes[Any] = PassThroughSerDes()
-
-_MAX_CONCURRENCY_LIMIT = 10000
 
 
 @dataclass(frozen=True)

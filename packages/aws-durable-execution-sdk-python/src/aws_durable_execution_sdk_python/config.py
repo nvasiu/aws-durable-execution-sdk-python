@@ -576,8 +576,8 @@ def _validate_bucket_owner(value: str | None) -> None:
         raise ValidationError(msg)
 
 
-def _validate_columns(name: str, columns: tuple[str, ...] | None) -> None:
-    """Validate a CSV columns/headers tuple is non-empty with no duplicates."""
+def _validate_columns(name: str, columns: list[str] | None) -> None:
+    """Validate a CSV columns/headers list is non-empty with no duplicates."""
     if columns is None:
         return
     if len(columns) == 0:
@@ -786,15 +786,15 @@ def _parse_delimiter(
 
 
 @dataclass(frozen=True)
-class S3SourceConfig:
-    """Resolved S3 source configuration."""
+class S3Source:
+    """Resolved S3 source."""
 
     bucket: str
     key: str | None = None
     prefix: str | None = None
     fmt: DistributedMapSourceFormat | None = None
     delimiter: DistributedMapCsvDelimiter | None = None
-    headers: tuple[str, ...] | None = None
+    headers: list[str] | None = None
     expected_bucket_owner: str | None = None
 
     def __post_init__(self) -> None:
@@ -803,8 +803,8 @@ class S3SourceConfig:
 
 
 @dataclass(frozen=True)
-class ReaderSourceConfig:
-    """Resolved reader-function source configuration."""
+class ReaderSource:
+    """Resolved reader-function source."""
 
     function_name: str
     initial_state: Any = None
@@ -819,10 +819,10 @@ class DistributedMapSource:
     """Source configuration for a map run."""
 
     max_items: int | None = None
-    inline_items: tuple[Any, ...] | None = None
+    inline_items: list[Any] | None = None
     inline_serdes: SerDes | None = None  # None = DEFAULT_JSON_SERDES
-    s3: S3SourceConfig | None = None
-    reader: ReaderSourceConfig | None = None
+    s3: S3Source | None = None
+    reader: ReaderSource | None = None
 
     def __post_init__(self) -> None:
         if self.max_items is not None and self.max_items < 1:
@@ -837,30 +837,24 @@ class DistributedMapSource:
             msg = "exactly one of inline_items, s3 or reader must be set"
             raise ValidationError(msg)
 
-
-class InlineSource:
-    """Inline source factory."""
-
-    @staticmethod
-    def of(
+    @classmethod
+    def inline(
+        cls,
         items: Sequence[Any],
         *,
         serdes: SerDes | None = None,
         max_items: int | None = None,
     ) -> DistributedMapSource:
         """An in-memory list of items embedded in the start checkpoint."""
-        return DistributedMapSource(
-            inline_items=tuple(items),
+        return cls(
+            inline_items=list(items),
             inline_serdes=serdes,
             max_items=max_items,
         )
 
-
-class S3Source:
-    """S3 source factories."""
-
-    @staticmethod
-    def json_lines(
+    @classmethod
+    def s3_json_lines(
+        cls,
         uri: str,
         *,
         expected_bucket_owner: str | None = None,
@@ -870,11 +864,11 @@ class S3Source:
         parsed_uri = S3Uri.parse(uri)
         bucket, key = parsed_uri.bucket, parsed_uri.path
         if key is None:
-            msg = "json_lines requires an S3 object key"
+            msg = "s3_json_lines requires an S3 object key"
             raise ValidationError(msg)
-        return DistributedMapSource(
+        return cls(
             max_items=max_items,
-            s3=S3SourceConfig(
+            s3=S3Source(
                 bucket=bucket,
                 key=key,
                 fmt=DistributedMapSourceFormat.JSON_LINES,
@@ -882,8 +876,9 @@ class S3Source:
             ),
         )
 
-    @staticmethod
-    def json_array(
+    @classmethod
+    def s3_json_array(
+        cls,
         uri: str,
         *,
         expected_bucket_owner: str | None = None,
@@ -893,11 +888,11 @@ class S3Source:
         parsed_uri = S3Uri.parse(uri)
         bucket, key = parsed_uri.bucket, parsed_uri.path
         if key is None:
-            msg = "json_array requires an S3 object key"
+            msg = "s3_json_array requires an S3 object key"
             raise ValidationError(msg)
-        return DistributedMapSource(
+        return cls(
             max_items=max_items,
-            s3=S3SourceConfig(
+            s3=S3Source(
                 bucket=bucket,
                 key=key,
                 fmt=DistributedMapSourceFormat.JSON_ARRAY,
@@ -905,8 +900,9 @@ class S3Source:
             ),
         )
 
-    @staticmethod
-    def csv(
+    @classmethod
+    def s3_csv(
+        cls,
         uri: str,
         *,
         headers: Sequence[str] | None = None,
@@ -918,22 +914,23 @@ class S3Source:
         parsed_uri = S3Uri.parse(uri)
         bucket, key = parsed_uri.bucket, parsed_uri.path
         if key is None:
-            msg = "csv requires an S3 object key"
+            msg = "s3_csv requires an S3 object key"
             raise ValidationError(msg)
-        return DistributedMapSource(
+        return cls(
             max_items=max_items,
-            s3=S3SourceConfig(
+            s3=S3Source(
                 bucket=bucket,
                 key=key,
                 fmt=DistributedMapSourceFormat.CSV,
                 delimiter=_parse_delimiter(delimiter),
-                headers=tuple(headers) if headers is not None else None,
+                headers=list(headers) if headers is not None else None,
                 expected_bucket_owner=expected_bucket_owner,
             ),
         )
 
-    @staticmethod
-    def objects(
+    @classmethod
+    def s3_objects(
+        cls,
         prefix_uri: str,
         *,
         expected_bucket_owner: str | None = None,
@@ -942,17 +939,18 @@ class S3Source:
         """Read each object under a prefix as one item."""
         parsed_uri = S3Uri.parse(prefix_uri)
         bucket, prefix = parsed_uri.bucket, parsed_uri.path
-        return DistributedMapSource(
+        return cls(
             max_items=max_items,
-            s3=S3SourceConfig(
+            s3=S3Source(
                 bucket=bucket,
                 prefix=prefix or "",
                 expected_bucket_owner=expected_bucket_owner,
             ),
         )
 
-    @staticmethod
-    def flattened_json_lines(
+    @classmethod
+    def s3_flattened_json_lines(
+        cls,
         prefix_uri: str,
         *,
         expected_bucket_owner: str | None = None,
@@ -961,9 +959,9 @@ class S3Source:
         """Read a prefix, flattening each object's lines into items."""
         parsed_uri = S3Uri.parse(prefix_uri)
         bucket, prefix = parsed_uri.bucket, parsed_uri.path
-        return DistributedMapSource(
+        return cls(
             max_items=max_items,
-            s3=S3SourceConfig(
+            s3=S3Source(
                 bucket=bucket,
                 prefix=prefix or "",
                 fmt=DistributedMapSourceFormat.JSON_LINES,
@@ -971,8 +969,9 @@ class S3Source:
             ),
         )
 
-    @staticmethod
-    def flattened_json_array(
+    @classmethod
+    def s3_flattened_json_array(
+        cls,
         prefix_uri: str,
         *,
         expected_bucket_owner: str | None = None,
@@ -981,9 +980,9 @@ class S3Source:
         """Read a prefix, flattening each object's JSON array elements into items."""
         parsed_uri = S3Uri.parse(prefix_uri)
         bucket, prefix = parsed_uri.bucket, parsed_uri.path
-        return DistributedMapSource(
+        return cls(
             max_items=max_items,
-            s3=S3SourceConfig(
+            s3=S3Source(
                 bucket=bucket,
                 prefix=prefix or "",
                 fmt=DistributedMapSourceFormat.JSON_ARRAY,
@@ -991,8 +990,9 @@ class S3Source:
             ),
         )
 
-    @staticmethod
-    def flattened_csv(
+    @classmethod
+    def s3_flattened_csv(
+        cls,
         prefix_uri: str,
         *,
         headers: Sequence[str] | None = None,
@@ -1003,24 +1003,21 @@ class S3Source:
         """Read a prefix, flattening each object's records into items."""
         parsed_uri = S3Uri.parse(prefix_uri)
         bucket, prefix = parsed_uri.bucket, parsed_uri.path
-        return DistributedMapSource(
+        return cls(
             max_items=max_items,
-            s3=S3SourceConfig(
+            s3=S3Source(
                 bucket=bucket,
                 prefix=prefix or "",
                 fmt=DistributedMapSourceFormat.CSV,
                 delimiter=_parse_delimiter(delimiter),
-                headers=tuple(headers) if headers is not None else None,
+                headers=list(headers) if headers is not None else None,
                 expected_bucket_owner=expected_bucket_owner,
             ),
         )
 
-
-class ReaderSource:
-    """Reader-function source factories."""
-
-    @staticmethod
-    def from_function(
+    @classmethod
+    def reader_function(
+        cls,
         name: str,
         *,
         initial_state: Any = None,
@@ -1028,9 +1025,9 @@ class ReaderSource:
         max_items: int | None = None,
     ) -> DistributedMapSource:
         """Page items from a customer-supplied reader Lambda function."""
-        return DistributedMapSource(
+        return cls(
             max_items=max_items,
-            reader=ReaderSourceConfig(
+            reader=ReaderSource(
                 function_name=name,
                 initial_state=initial_state,
                 state_serdes=state_serdes,
@@ -1054,6 +1051,25 @@ class SuccessDestination:
             msg = "success destination must include input or output"
             raise ValidationError(msg)
 
+    @classmethod
+    def from_uri(
+        cls,
+        prefix_uri: str,
+        *,
+        include_input: bool = False,
+        include_output: bool = True,
+        expected_bucket_owner: str | None = None,
+    ) -> SuccessDestination:
+        """Route succeeded item records to an S3 prefix."""
+        parsed_uri = S3Uri.parse(prefix_uri)
+        return cls(
+            bucket=parsed_uri.bucket,
+            prefix=parsed_uri.path or "",
+            include_input=include_input,
+            include_output=include_output,
+            expected_bucket_owner=expected_bucket_owner,
+        )
+
 
 @dataclass(frozen=True)
 class FailureDestination:
@@ -1071,39 +1087,9 @@ class FailureDestination:
             msg = "failure destination must include input or error"
             raise ValidationError(msg)
 
-
-@dataclass(frozen=True)
-class DistributedMapDestinationConfig:
-    """Destination routing for map run results."""
-
-    on_success: SuccessDestination | None = None
-    on_failure: FailureDestination | None = None
-
-
-class S3Destination:
-    """S3 destination factories."""
-
-    @staticmethod
-    def successes(
-        prefix_uri: str,
-        *,
-        include_input: bool = False,
-        include_output: bool = True,
-        expected_bucket_owner: str | None = None,
-    ) -> SuccessDestination:
-        """Route succeeded item records to an S3 prefix."""
-        parsed_uri = S3Uri.parse(prefix_uri)
-        bucket, prefix = parsed_uri.bucket, parsed_uri.path
-        return SuccessDestination(
-            bucket=bucket,
-            prefix=prefix or "",
-            include_input=include_input,
-            include_output=include_output,
-            expected_bucket_owner=expected_bucket_owner,
-        )
-
-    @staticmethod
-    def failures(
+    @classmethod
+    def from_uri(
+        cls,
         prefix_uri: str,
         *,
         include_input: bool = True,
@@ -1112,10 +1098,9 @@ class S3Destination:
     ) -> FailureDestination:
         """Route permanently-failed item records to an S3 prefix."""
         parsed_uri = S3Uri.parse(prefix_uri)
-        bucket, prefix = parsed_uri.bucket, parsed_uri.path
-        return FailureDestination(
-            bucket=bucket,
-            prefix=prefix or "",
+        return cls(
+            bucket=parsed_uri.bucket,
+            prefix=parsed_uri.path or "",
             include_input=include_input,
             include_error=include_error,
             expected_bucket_owner=expected_bucket_owner,
@@ -1123,10 +1108,18 @@ class S3Destination:
 
 
 @dataclass(frozen=True)
+class DistributedMapDestination:
+    """Destination routing for map run results."""
+
+    on_success: SuccessDestination | None = None
+    on_failure: FailureDestination | None = None
+
+
+@dataclass(frozen=True)
 class DistributedMapConfig:
     """Configuration for map run operations."""
 
-    destination: DistributedMapDestinationConfig | None = None
+    destination: DistributedMapDestination | None = None
     completion_config: DistributedMapCompletionConfig | None = None
     timeout: Duration | None = None
 

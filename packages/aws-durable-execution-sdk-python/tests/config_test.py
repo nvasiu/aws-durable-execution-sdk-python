@@ -25,11 +25,11 @@ from aws_durable_execution_sdk_python.waits import (
 from aws_durable_execution_sdk_python.config import (
     DistributedMapCompletionConfig,
     DistributedMapConfig,
-    S3Destination,
-    S3Source,
+    SuccessDestination,
+    FailureDestination,
     DistributedMapProcessor,
     DistributedMapSource,
-    ReaderSourceConfig,
+    ReaderSource,
 )
 
 
@@ -304,22 +304,24 @@ def test_retry_duration_out_of_range_rejected():
 
 def test_expected_bucket_owner_must_be_12_digits():
     with pytest.raises(ValidationError, match="12-digit"):
-        S3Source.json_lines("s3://b/k.jsonl", expected_bucket_owner="123")
+        DistributedMapSource.s3_json_lines(
+            "s3://b/k.jsonl", expected_bucket_owner="123"
+        )
 
 
 def test_csv_delimiter_invalid_string_rejected():
     with pytest.raises(ValidationError, match="delimiter must be one of"):
-        S3Source.csv("s3://b/data.csv", delimiter="BAR")
+        DistributedMapSource.s3_csv("s3://b/data.csv", delimiter="BAR")
 
 
 def test_csv_headers_duplicates_rejected():
     with pytest.raises(ValidationError, match="duplicates"):
-        S3Source.csv("s3://b/k.csv", headers=["a", "a"])
+        DistributedMapSource.s3_csv("s3://b/k.csv", headers=["a", "a"])
 
 
 def test_json_lines_requires_key():
     with pytest.raises(ValidationError, match="object key"):
-        S3Source.json_lines("s3://bucket-only")
+        DistributedMapSource.s3_json_lines("s3://bucket-only")
 
 
 def test_timeout_out_of_range_rejected():
@@ -389,12 +391,12 @@ def test_retry_duration_below_minimum_rejected():
 
 def test_max_items_below_one_rejected():
     with pytest.raises(ValidationError, match="at least 1"):
-        S3Source.json_lines("s3://b/k.jsonl", max_items=0)
+        DistributedMapSource.s3_json_lines("s3://b/k.jsonl", max_items=0)
 
 
 def test_csv_requires_object_key():
     with pytest.raises(ValidationError, match="csv requires an S3 object key"):
-        S3Source.csv("s3://bucket")
+        DistributedMapSource.s3_csv("s3://bucket")
 
 
 def test_source_without_any_kind_rejected():
@@ -406,35 +408,37 @@ def test_source_with_two_kinds_rejected():
     with pytest.raises(ValidationError, match="exactly one of"):
         DistributedMapSource(
             inline_items=("a",),
-            reader=ReaderSourceConfig(function_name="r"),
+            reader=ReaderSource(function_name="r"),
         )
 
 
 def test_success_destination_all_false_rejected():
     with pytest.raises(ValidationError, match="success destination must include"):
-        S3Destination.successes(
+        SuccessDestination.from_uri(
             "s3://out/ok", include_input=False, include_output=False
         )
 
 
 def test_failure_destination_all_false_rejected():
     with pytest.raises(ValidationError, match="failure destination must include"):
-        S3Destination.failures("s3://out/bad", include_input=False, include_error=False)
+        FailureDestination.from_uri(
+            "s3://out/bad", include_input=False, include_error=False
+        )
 
 
 def test_invalid_s3_uri_rejected():
     with pytest.raises(ValidationError, match="Invalid S3 URI"):
-        S3Source.json_lines("s3:///key.jsonl")
+        DistributedMapSource.s3_json_lines("s3:///key.jsonl")
 
 
 def test_non_s3_scheme_uri_rejected():
     with pytest.raises(ValidationError, match="must start with s3://"):
-        S3Source.json_lines("http://foo/bar")
+        DistributedMapSource.s3_json_lines("http://foo/bar")
 
 
 def test_csv_empty_headers_rejected():
     with pytest.raises(ValidationError, match="must be non-empty"):
-        S3Source.csv("s3://b/f.csv", headers=[])
+        DistributedMapSource.s3_csv("s3://b/f.csv", headers=[])
 
 
 def test_negative_retry_attempts_rejected():

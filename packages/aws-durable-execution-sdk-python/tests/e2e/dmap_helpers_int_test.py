@@ -7,8 +7,11 @@ full invocation harness with a mocked checkpoint backend.
 from __future__ import annotations
 
 import json
+import threading
+import time
 from unittest.mock import Mock, patch
 
+from aws_durable_execution_sdk_python.config import ProcessorResponseMode
 from aws_durable_execution_sdk_python.dmap.handlers import (
     durable_distributed_map_batch_handler,
     durable_distributed_map_item_handler,
@@ -138,9 +141,55 @@ def test_durable_batch_handler_returns_value():
 
 def test_durable_item_handler_failures_form():
     handler = durable_distributed_map_item_handler(
-        lambda _ctx, item: item, report="failures"
+        lambda _ctx, item: item, response_mode=ProcessorResponseMode.ITEM_FAILURES
     )
     result = _run(handler, [{"itemId": "0", "body": "1"}])
     assert result["Status"] == InvocationStatus.SUCCEEDED.value
     data = json.loads(result["Result"])
     assert data == {"batchItemFailures": []}
+
+
+def test_durable_item_handler_runs_items_one_at_a_time_by_default():
+    lock = threading.Lock()
+    in_flight = 0
+    peak = 0
+
+    def process(_ctx, item):
+        nonlocal in_flight, peak
+        with lock:
+            in_flight += 1
+            peak = max(peak, in_flight)
+        # Hold the branch so that a wider bound would overlap this item with the
+        # next one, which is what makes the peak below meaningful.
+        time.sleep(0.02)
+        with lock:
+            in_flight -= 1
+        return item
+
+    handler = durable_distributed_map_item_handler(process)
+    result = _run(handler, [{"itemId": str(i), "body": "1"} for i in range(4)])
+    assert result["Status"] == InvocationStatus.SUCCEEDED.value
+    assert peak == 1
+
+
+def test_durable_item_handler_honors_requested_concurrency():
+    # Each item blocks until all four have arrived, so the batch only finishes
+    # if the map really runs four items at once. At a smaller bound the first
+    # item waits out the timeout and every item fails.
+    barrier = threading.Barrier(4, timeout=5)
+
+    def process(_ctx, item):
+        barrier.wait()
+        return item
+
+    handler = durable_distributed_map_item_handler(process, concurrency=4)
+    result = _run(handler, [{"itemId": str(i), "body": str(i)} for i in range(4)])
+    assert result["Status"] == InvocationStatus.SUCCEEDED.value
+    data = json.loads(result["Result"])
+    assert data["batchItemFailures"] == []
+    assert data["batchItemResults"] == [
+        {"itemIdentifier": "0", "output": "0"},
+        {"itemIdentifier": "1", "output": "1"},
+        {"itemIdentifier": "2", "output": "2"},
+        {"itemIdentifier": "3", "output": "3"},
+    ]
