@@ -12,6 +12,7 @@ from typing import (
     NoReturn,
     ParamSpec,
     TypeVar,
+    overload,
 )
 
 from aws_durable_execution_sdk_python.config import (
@@ -20,6 +21,10 @@ from aws_durable_execution_sdk_python.config import (
     Duration,
     InvokeConfig,
     MapConfig,
+    DistributedMapConfig,
+    DistributedMapProcessor,
+    DistributedMapResultConfig,
+    DistributedMapSource,
     ParallelBranch,
     ParallelConfig,
     StepConfig,
@@ -27,6 +32,10 @@ from aws_durable_execution_sdk_python.config import (
 )
 from aws_durable_execution_sdk_python.concurrency.models import (
     envelope_summary_generator,
+)
+from aws_durable_execution_sdk_python.dmap.models import (
+    DistributedMapResult,
+    DistributedMapSummary,
 )
 from aws_durable_execution_sdk_python.exceptions import (
     CallbackError,
@@ -54,6 +63,9 @@ from aws_durable_execution_sdk_python.operation.callback import (
 from aws_durable_execution_sdk_python.operation.child import child_handler
 from aws_durable_execution_sdk_python.operation.invoke import InvokeOperationExecutor
 from aws_durable_execution_sdk_python.operation.map import map_handler
+from aws_durable_execution_sdk_python.operation.dmap import (
+    DistributedMapOperationExecutor,
+)
 from aws_durable_execution_sdk_python.operation.parallel import parallel_handler
 from aws_durable_execution_sdk_python.operation.step import StepOperationExecutor
 from aws_durable_execution_sdk_python.operation.wait import WaitOperationExecutor
@@ -677,6 +689,72 @@ class DurableContext(DurableContextProtocol):
             executor: InvokeOperationExecutor[R] = InvokeOperationExecutor(
                 function_name=function_name,
                 payload=payload,
+                state=self.state,
+                operation_identifier=operation_identifier,
+                config=config,
+            )
+            return executor.process()
+
+    @overload
+    def distributed_map(
+        self,
+        source: DistributedMapSource | Sequence[Any],
+        processor: DistributedMapProcessor,
+        max_concurrency: int,
+        name: str | None = None,
+        *,
+        config: DistributedMapResultConfig,
+    ) -> DistributedMapResult: ...
+
+    @overload
+    def distributed_map(
+        self,
+        source: DistributedMapSource | Sequence[Any],
+        processor: DistributedMapProcessor,
+        max_concurrency: int,
+        name: str | None = None,
+        *,
+        config: DistributedMapConfig | None = None,
+    ) -> DistributedMapSummary: ...
+
+    def distributed_map(
+        self,
+        source: DistributedMapSource | Sequence[Any],
+        processor: DistributedMapProcessor,
+        max_concurrency: int,
+        name: str | None = None,
+        *,
+        config: DistributedMapConfig | None = None,
+    ) -> DistributedMapSummary:
+        """Start a distributed map run and resolve with its summary.
+
+        Args:
+            source: The items to process (a typed source or a plain-list shorthand)
+            processor: The processor configuration built via a DistributedMapProcessor factory
+            max_concurrency: Maximum concurrent processor invocations. Required,
+                with no service default.
+            name: Optional name for the operation
+            config: Optional run-level configuration
+
+        Returns:
+            The map run's summary, or a DistributedMapResult when a
+            DistributedMapResultConfig is passed
+        """
+        if not isinstance(source, (DistributedMapSource, list, tuple)):
+            msg = "source must be a DistributedMapSource or a list/tuple of items"
+            raise ValidationError(msg)
+        if max_concurrency < 1:
+            msg = f"max_concurrency must be greater than zero, got: {max_concurrency}"
+            raise ValidationError(msg)
+        if config is None:
+            config = DistributedMapConfig()
+        with self._operation_replay_aware(
+            OperationSubType.DISTRIBUTED_MAP, name
+        ) as operation_identifier:
+            executor: DistributedMapOperationExecutor = DistributedMapOperationExecutor(
+                source=source,
+                processor=processor,
+                max_concurrency=max_concurrency,
                 state=self.state,
                 operation_identifier=operation_identifier,
                 config=config,
