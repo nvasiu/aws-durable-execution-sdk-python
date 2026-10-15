@@ -297,9 +297,13 @@ def test_completion_decision_rejects_outcome_when_not_complete():
 
 def test_retry_duration_out_of_range_rejected():
     with pytest.raises(ValidationError, match="between 1 minute and 6 hours"):
-        DistributedMapProcessor.batch("p", max_retry_duration=Duration.from_seconds(30))
+        DistributedMapProcessor.report_batch_outcome(
+            "p", max_retry_duration=Duration.from_seconds(30)
+        )
     with pytest.raises(ValidationError, match="between 1 minute and 6 hours"):
-        DistributedMapProcessor.batch("p", max_retry_duration=Duration.from_hours(7))
+        DistributedMapProcessor.report_batch_outcome(
+            "p", max_retry_duration=Duration.from_hours(7)
+        )
 
 
 def test_expected_bucket_owner_must_be_12_digits():
@@ -331,7 +335,7 @@ def test_timeout_out_of_range_rejected():
 
 def test_empty_function_name_rejected():
     with pytest.raises(ValidationError, match="non-empty"):
-        DistributedMapProcessor.batch("")
+        DistributedMapProcessor.report_batch_outcome("")
 
 
 def test_valid_function_references_accepted():
@@ -343,12 +347,12 @@ def test_valid_function_references_accepted():
         "arn:aws:lambda:us-east-1:123456789012:function:my-func:1",
     ):
         # Should not raise.
-        DistributedMapProcessor.batch(ref)
+        DistributedMapProcessor.report_batch_outcome(ref)
 
 
 def test_function_name_over_max_length_rejected():
     with pytest.raises(ValidationError, match="at most 170 characters"):
-        DistributedMapProcessor.batch("f" * 171)
+        DistributedMapProcessor.report_batch_outcome("f" * 171)
 
 
 def test_completion_count_and_percentage_mutually_exclusive():
@@ -358,9 +362,17 @@ def test_completion_count_and_percentage_mutually_exclusive():
         )
 
 
+def test_completion_config_without_a_threshold_rejected():
+    """Omitting the config means zero tolerated failures, so an empty one is an error."""
+    with pytest.raises(ValidationError, match="must set tolerated_failure_count"):
+        DistributedMapCompletionConfig()
+
+
 def test_completion_sample_size_requires_percentage():
     with pytest.raises(ValidationError, match="minimum_sample_size"):
-        DistributedMapCompletionConfig(minimum_sample_size=10)
+        DistributedMapCompletionConfig(
+            tolerated_failure_count=1, minimum_sample_size=10
+        )
 
 
 def test_completion_negative_count_rejected():
@@ -371,6 +383,12 @@ def test_completion_negative_count_rejected():
 def test_completion_percentage_out_of_range_rejected():
     with pytest.raises(ValidationError, match="between 0 and 100"):
         DistributedMapCompletionConfig(tolerated_failure_percentage=150)
+
+
+def test_completion_fractional_percentage_rejected():
+    """The service's percentage is an integer, so a fraction is rejected at the call site."""
+    with pytest.raises(ValidationError, match="must be an integer"):
+        DistributedMapCompletionConfig(tolerated_failure_percentage=12.5)  # type: ignore[arg-type]
 
 
 def test_completion_sample_size_below_one_rejected():
@@ -386,12 +404,40 @@ def test_completion_failure_count_factory():
 
 def test_retry_duration_below_minimum_rejected():
     with pytest.raises(ValidationError, match="1 minute and 6 hours"):
-        DistributedMapProcessor.batch("p", max_retry_duration=Duration.from_seconds(30))
+        DistributedMapProcessor.report_batch_outcome(
+            "p", max_retry_duration=Duration.from_seconds(30)
+        )
 
 
 def test_max_items_below_one_rejected():
-    with pytest.raises(ValidationError, match="at least 1"):
+    with pytest.raises(ValidationError, match="between 1 and 100000000"):
         DistributedMapSource.s3_json_lines("s3://b/k.jsonl", max_items=0)
+
+
+def test_max_items_above_the_service_maximum_rejected():
+    with pytest.raises(ValidationError, match="between 1 and 100000000"):
+        DistributedMapSource.s3_json_lines("s3://b/k.jsonl", max_items=100_000_001)
+
+
+def test_csv_headers_above_the_count_limit_rejected():
+    with pytest.raises(ValidationError, match="at most 1000 names"):
+        DistributedMapSource.s3_csv(
+            "s3://b/f.csv", headers=[f"c{i}" for i in range(1001)]
+        )
+
+
+def test_csv_header_name_above_the_length_limit_rejected():
+    with pytest.raises(ValidationError, match="at most 256 characters"):
+        DistributedMapSource.s3_csv("s3://b/f.csv", headers=["a" * 257])
+
+
+def test_csv_headers_at_the_limits_accepted():
+    source = DistributedMapSource.s3_csv(
+        "s3://b/f.csv", headers=[f"c{i}" for i in range(999)] + ["a" * 256]
+    )
+    assert source.s3 is not None
+    assert source.s3.headers is not None
+    assert len(source.s3.headers) == 1000
 
 
 def test_csv_requires_object_key():
@@ -443,14 +489,29 @@ def test_csv_empty_headers_rejected():
 
 def test_negative_retry_attempts_rejected():
     with pytest.raises(ValidationError, match="non-negative"):
-        DistributedMapProcessor.batch("p", max_retry_attempts=-5)
+        DistributedMapProcessor.report_batch_outcome("p", max_retry_attempts=-5)
+
+
+@pytest.mark.parametrize("attempts", ["5", "forever", "UNLIMITED", 2.5])
+def test_retry_attempts_that_is_not_an_int_or_unlimited_rejected(attempts):
+    with pytest.raises(ValidationError, match="non-negative integer"):
+        DistributedMapProcessor.report_batch_outcome("p", max_retry_attempts=attempts)
+
+
+def test_unlimited_retry_attempts_accepted():
+    processor = DistributedMapProcessor.report_batch_outcome(
+        "p", max_retry_attempts=DistributedMapProcessor.UNLIMITED
+    )
+    assert processor.max_retry_attempts == DistributedMapProcessor.UNLIMITED
 
 
 def test_batch_size_out_of_range_rejected():
     with pytest.raises(ValidationError, match="between 1 and 10000"):
-        DistributedMapProcessor.batch("p", batch_size=0)
+        DistributedMapProcessor.report_batch_outcome("p", batch_size=0)
 
 
 def test_durable_execution_name_prefix_too_long_rejected():
     with pytest.raises(ValidationError, match="1 to 36 characters"):
-        DistributedMapProcessor.batch("p", durable_execution_name_prefix="x" * 37)
+        DistributedMapProcessor.report_batch_outcome(
+            "p", durable_execution_name_prefix="x" * 37
+        )

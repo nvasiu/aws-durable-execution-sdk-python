@@ -26,11 +26,11 @@ from aws_durable_execution_sdk_python.config import (
     DistributedMapCompletionConfig as ConfigCompletionConfig,
 )
 from aws_durable_execution_sdk_python.config import (
-    DistributedMapCompletionReason,
     DistributedMapCsvDelimiter,
     DistributedMapDestination,
     DistributedMapItemStatus,
     DistributedMapProcessor,
+    DistributedMapS3SourceType,
     DistributedMapSourceFormat,
     FailureDestination,
     ProcessorResponseMode,
@@ -138,19 +138,13 @@ class DistributedMapSourceType(Enum):
     READER_FUNCTION = "READER_FUNCTION"
 
 
-class DistributedMapS3SourceTransform(Enum):
-    NONE = "NONE"
-    LOAD_AND_FLATTEN = "LOAD_AND_FLATTEN"
-
-
 class DistributedMapCsvHeaderLocation(Enum):
     FIRST_ROW = "FIRST_ROW"
     GIVEN = "GIVEN"
 
 
 class DistributedMapFunctionResponseType(Enum):
-    REPORT_BATCH_ITEM_FAILURES = "REPORT_BATCH_ITEM_FAILURES"
-    REPORT_BATCH_ITEM_RESULTS = "REPORT_BATCH_ITEM_RESULTS"
+    REPORT_BATCH_ITEM_OUTCOMES = "REPORT_BATCH_ITEM_OUTCOMES"
 
 
 class DistributedMapDestinationType(Enum):
@@ -480,10 +474,22 @@ class DistributedMapResultItem:
     @classmethod
     def from_dict(cls, data: MutableMapping[str, Any]) -> DistributedMapResultItem:
         error_raw = data.get("Error")
+        status_raw = data.get("Status")
+        # Status is required, so its absence breaks the contract and must fail.
+        # An unrecognized value is a status added after this SDK version.
+        if not status_raw:
+            msg = (
+                f"Distributed map result item {data.get('ItemId', '')!r} carried "
+                f"no item status"
+            )
+            raise ExecutionError(msg)
         return cls(
             item_id=data.get("ItemId", ""),
             status=_parse_enum(
-                DistributedMapItemStatus, data.get("Status", ""), "item status"
+                DistributedMapItemStatus,
+                status_raw,
+                "item status",
+                unknown_fallback=DistributedMapItemStatus.UNKNOWN_TO_SDK_VERSION,
             ),
             output=data.get("Output"),
             error=ErrorObject.from_dict(error_raw) if error_raw else None,
@@ -503,9 +509,9 @@ class DistributedMapResultItem:
 
 @dataclass(frozen=True)
 class DistributedMapDetails:
-    completion_reason: DistributedMapCompletionReason | None = None
     distributed_map_run_arn: str | None = None
-    completion_details: str | None = None
+    source_exhausted: bool | None = None
+    error: ErrorObject | None = None
     total_count: int | None = None
     success_count: int = 0
     failure_count: int = 0
@@ -515,22 +521,11 @@ class DistributedMapDetails:
     @classmethod
     def from_dict(cls, data: MutableMapping[str, Any]) -> DistributedMapDetails:
         results_raw = data.get("Results")
-        reason_raw = data.get("CompletionReason")
-        # CompletionReason is absent while a run is in flight, so parse it only
-        # when present rather than requiring it.
+        error_raw = data.get("Error")
         return cls(
-            completion_reason=(
-                _parse_enum(
-                    DistributedMapCompletionReason,
-                    reason_raw,
-                    "completion reason",
-                    unknown_fallback=DistributedMapCompletionReason.UNKNOWN_TO_SDK_VERSION,
-                )
-                if reason_raw is not None
-                else None
-            ),
             distributed_map_run_arn=data.get("DistributedMapRunArn"),
-            completion_details=data.get("CompletionDetails"),
+            source_exhausted=data.get("SourceExhausted"),
+            error=ErrorObject.from_dict(error_raw) if error_raw else None,
             total_count=data.get("TotalCount"),
             success_count=data.get("SuccessCount", 0),
             failure_count=data.get("FailureCount", 0),
@@ -687,72 +682,175 @@ class DistributedMapCsvFormatOptions:
 
 
 @dataclass(frozen=True)
-class DistributedMapS3SourceConfig:
-    """Represent an S3 distributed map source config."""
+class DistributedMapS3ObjectConfig:
+    """Represent the object an OBJECT S3 source reads."""
 
-    bucket: str
-    key: str | None = None
-    key_prefix: str | None = None
-    transform: DistributedMapS3SourceTransform | None = None
-    expected_bucket_owner: str | None = None
-    fmt: DistributedMapSourceFormat | None = None
+    key: str
+    fmt: DistributedMapSourceFormat
     csv_format_options: DistributedMapCsvFormatOptions | None = None
 
     def to_dict(self) -> MutableMapping[str, Any]:
-        result: MutableMapping[str, Any] = {"Bucket": self.bucket}
-        if self.key is not None:
-            result["Key"] = self.key
-        if self.key_prefix is not None:
-            result["KeyPrefix"] = self.key_prefix
-        if self.transform is not None:
-            result["Transform"] = self.transform.value
-        if self.expected_bucket_owner is not None:
-            result["ExpectedBucketOwner"] = self.expected_bucket_owner
-        if self.fmt is not None:
-            result["Format"] = self.fmt.value
+        result: MutableMapping[str, Any] = {
+            "Key": self.key,
+            "Format": self.fmt.value,
+        }
         if self.csv_format_options is not None:
             result["CsvFormatOptions"] = self.csv_format_options.to_dict()
         return result
 
     @classmethod
-    def from_dict(cls, data: MutableMapping[str, Any]) -> DistributedMapS3SourceConfig:
-        transform = data.get("Transform")
-        fmt = data.get("Format")
+    def from_dict(cls, data: MutableMapping[str, Any]) -> DistributedMapS3ObjectConfig:
         csv_raw = data.get("CsvFormatOptions")
         return cls(
-            bucket=data.get("Bucket", ""),
-            key=data.get("Key"),
-            key_prefix=data.get("KeyPrefix"),
-            transform=DistributedMapS3SourceTransform(transform)
-            if transform is not None
-            else None,
-            expected_bucket_owner=data.get("ExpectedBucketOwner"),
-            fmt=DistributedMapSourceFormat(fmt) if fmt is not None else None,
+            key=data.get("Key", ""),
+            fmt=DistributedMapSourceFormat(data["Format"]),
             csv_format_options=DistributedMapCsvFormatOptions.from_dict(csv_raw)
             if csv_raw is not None
             else None,
         )
 
-    @staticmethod
-    def _transform_for(s3: S3Source) -> DistributedMapS3SourceTransform | None:
-        """A prefix source flattens when a format is set, and lists keys when it is not."""
-        if s3.prefix is None:
-            return None
-        if s3.fmt is None:
-            return DistributedMapS3SourceTransform.NONE
-        return DistributedMapS3SourceTransform.LOAD_AND_FLATTEN
+
+@dataclass(frozen=True)
+class DistributedMapS3ListedObjectMetadataConfig:
+    """Represent the prefix a LISTED_OBJECT_METADATA S3 source lists."""
+
+    key_prefix: str
+
+    def to_dict(self) -> MutableMapping[str, Any]:
+        return {"KeyPrefix": self.key_prefix}
+
+    @classmethod
+    def from_dict(
+        cls, data: MutableMapping[str, Any]
+    ) -> DistributedMapS3ListedObjectMetadataConfig:
+        return cls(key_prefix=data.get("KeyPrefix", ""))
+
+
+@dataclass(frozen=True)
+class DistributedMapS3ListedObjectsConfig:
+    """Represent the prefix a LISTED_OBJECTS S3 source lists and reads."""
+
+    key_prefix: str
+    fmt: DistributedMapSourceFormat
+    csv_format_options: DistributedMapCsvFormatOptions | None = None
+
+    def to_dict(self) -> MutableMapping[str, Any]:
+        result: MutableMapping[str, Any] = {
+            "KeyPrefix": self.key_prefix,
+            "Format": self.fmt.value,
+        }
+        if self.csv_format_options is not None:
+            result["CsvFormatOptions"] = self.csv_format_options.to_dict()
+        return result
+
+    @classmethod
+    def from_dict(
+        cls, data: MutableMapping[str, Any]
+    ) -> DistributedMapS3ListedObjectsConfig:
+        csv_raw = data.get("CsvFormatOptions")
+        return cls(
+            key_prefix=data.get("KeyPrefix", ""),
+            fmt=DistributedMapSourceFormat(data["Format"]),
+            csv_format_options=DistributedMapCsvFormatOptions.from_dict(csv_raw)
+            if csv_raw is not None
+            else None,
+        )
+
+
+@dataclass(frozen=True)
+class DistributedMapS3SourceConfig:
+    """Represent an S3 distributed map source config.
+
+    ``source_type`` selects which of the three config blocks is present. The
+    other two are absent.
+    """
+
+    source_type: DistributedMapS3SourceType
+    bucket: str
+    expected_bucket_owner: str | None = None
+    object_config: DistributedMapS3ObjectConfig | None = None
+    listed_object_metadata_config: DistributedMapS3ListedObjectMetadataConfig | None = (
+        None
+    )
+    listed_objects_config: DistributedMapS3ListedObjectsConfig | None = None
+
+    def to_dict(self) -> MutableMapping[str, Any]:
+        result: MutableMapping[str, Any] = {
+            "Type": self.source_type.value,
+            "Bucket": self.bucket,
+        }
+        if self.expected_bucket_owner is not None:
+            result["ExpectedBucketOwner"] = self.expected_bucket_owner
+        if self.object_config is not None:
+            result["ObjectConfig"] = self.object_config.to_dict()
+        if self.listed_object_metadata_config is not None:
+            result["ListedObjectMetadataConfig"] = (
+                self.listed_object_metadata_config.to_dict()
+            )
+        if self.listed_objects_config is not None:
+            result["ListedObjectsConfig"] = self.listed_objects_config.to_dict()
+        return result
+
+    @classmethod
+    def from_dict(cls, data: MutableMapping[str, Any]) -> DistributedMapS3SourceConfig:
+        object_raw = data.get("ObjectConfig")
+        metadata_raw = data.get("ListedObjectMetadataConfig")
+        listed_raw = data.get("ListedObjectsConfig")
+        return cls(
+            source_type=DistributedMapS3SourceType(data["Type"]),
+            bucket=data.get("Bucket", ""),
+            expected_bucket_owner=data.get("ExpectedBucketOwner"),
+            object_config=DistributedMapS3ObjectConfig.from_dict(object_raw)
+            if object_raw is not None
+            else None,
+            listed_object_metadata_config=(
+                DistributedMapS3ListedObjectMetadataConfig.from_dict(metadata_raw)
+                if metadata_raw is not None
+                else None
+            ),
+            listed_objects_config=DistributedMapS3ListedObjectsConfig.from_dict(
+                listed_raw
+            )
+            if listed_raw is not None
+            else None,
+        )
 
     @classmethod
     def from_source(cls, s3: S3Source) -> Self:
-        """Translate the S3 source, deriving the transform."""
+        """Translate the S3 source into its matching nested config block."""
+        csv_options = DistributedMapCsvFormatOptions.from_source(s3)
+        if s3.source_type is DistributedMapS3SourceType.OBJECT:
+            # S3Source.__post_init__ requires a key and a format for OBJECT.
+            return cls(
+                source_type=s3.source_type,
+                bucket=s3.bucket,
+                expected_bucket_owner=s3.expected_bucket_owner,
+                object_config=DistributedMapS3ObjectConfig(
+                    key=s3.key or "",
+                    fmt=s3.fmt or DistributedMapSourceFormat.JSON_LINES,
+                    csv_format_options=csv_options,
+                ),
+            )
+        if s3.source_type is DistributedMapS3SourceType.LISTED_OBJECT_METADATA:
+            return cls(
+                source_type=s3.source_type,
+                bucket=s3.bucket,
+                expected_bucket_owner=s3.expected_bucket_owner,
+                listed_object_metadata_config=(
+                    DistributedMapS3ListedObjectMetadataConfig(
+                        key_prefix=s3.key_prefix or ""
+                    )
+                ),
+            )
         return cls(
+            source_type=s3.source_type,
             bucket=s3.bucket,
-            key=s3.key,
-            key_prefix=s3.prefix,
-            transform=cls._transform_for(s3),
             expected_bucket_owner=s3.expected_bucket_owner,
-            fmt=s3.fmt,
-            csv_format_options=DistributedMapCsvFormatOptions.from_source(s3),
+            listed_objects_config=DistributedMapS3ListedObjectsConfig(
+                key_prefix=s3.key_prefix or "",
+                fmt=s3.fmt or DistributedMapSourceFormat.JSON_LINES,
+                csv_format_options=csv_options,
+            ),
         )
 
 
@@ -887,8 +985,7 @@ class DistributedMapSourceConfig:
 _UNLIMITED_RETRY_WIRE = -1
 
 _RESPONSE_TYPE_FOR_MODE = {
-    ProcessorResponseMode.ITEM_FAILURES: DistributedMapFunctionResponseType.REPORT_BATCH_ITEM_FAILURES,
-    ProcessorResponseMode.ITEM_RESULTS: DistributedMapFunctionResponseType.REPORT_BATCH_ITEM_RESULTS,
+    ProcessorResponseMode.ITEM_OUTCOMES: DistributedMapFunctionResponseType.REPORT_BATCH_ITEM_OUTCOMES,
 }
 
 
@@ -962,7 +1059,7 @@ class DistributedMapCompletionConfig:
     """Represent a map run completion (failure-tolerance) config."""
 
     tolerated_failure_count: int | None = None
-    tolerated_failure_percentage: float | None = None
+    tolerated_failure_percentage: int | None = None
     minimum_sample_size: int | None = None
 
     def to_dict(self) -> MutableMapping[str, Any]:
@@ -986,14 +1083,8 @@ class DistributedMapCompletionConfig:
         )
 
     @classmethod
-    def from_config(cls, completion_config: ConfigCompletionConfig) -> Self | None:
-        """Translate the completion config, or None when it carries no threshold."""
-        if (
-            completion_config.tolerated_failure_count is None
-            and completion_config.tolerated_failure_percentage is None
-            and completion_config.minimum_sample_size is None
-        ):
-            return None
+    def from_config(cls, completion_config: ConfigCompletionConfig) -> Self:
+        """Translate the completion config."""
         return cls(
             tolerated_failure_count=completion_config.tolerated_failure_count,
             tolerated_failure_percentage=completion_config.tolerated_failure_percentage,
@@ -1134,7 +1225,7 @@ class DistributedMapDestinationConfig:
         )
 
     @classmethod
-    def from_config(cls, destination: DistributedMapDestination) -> Self | None:
+    def from_destination(cls, destination: DistributedMapDestination) -> Self | None:
         """Translate the destination config, or None when neither side is set."""
         if destination.on_success is None and destination.on_failure is None:
             return None
@@ -1166,9 +1257,6 @@ class DistributedMapResultCollectionConfig:
         cls, data: MutableMapping[str, Any]
     ) -> DistributedMapResultCollectionConfig:
         return cls(mode=DistributedMapResultCollectionMode(data.get("Mode", "NONE")))
-
-
-_MAX_CONCURRENCY_LIMIT = 10000
 
 
 @dataclass(frozen=True)
@@ -1800,17 +1888,17 @@ class Operation:
                 "FailureCount": self.distributed_map_details.failure_count,
                 "UnprocessedCount": self.distributed_map_details.unprocessed_count,
             }
-            if self.distributed_map_details.completion_reason is not None:
-                distributed_map_details_dict["CompletionReason"] = (
-                    self.distributed_map_details.completion_reason.value
-                )
             if self.distributed_map_details.distributed_map_run_arn:
                 distributed_map_details_dict["DistributedMapRunArn"] = (
                     self.distributed_map_details.distributed_map_run_arn
                 )
-            if self.distributed_map_details.completion_details:
-                distributed_map_details_dict["CompletionDetails"] = (
-                    self.distributed_map_details.completion_details
+            if self.distributed_map_details.source_exhausted is not None:
+                distributed_map_details_dict["SourceExhausted"] = (
+                    self.distributed_map_details.source_exhausted
+                )
+            if self.distributed_map_details.error is not None:
+                distributed_map_details_dict["Error"] = (
+                    self.distributed_map_details.error.to_dict()
                 )
             if self.distributed_map_details.total_count is not None:
                 distributed_map_details_dict["TotalCount"] = (

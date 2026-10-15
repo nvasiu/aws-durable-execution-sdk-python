@@ -2,36 +2,24 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
+from typing import Any
 
 import pytest
 
-from aws_durable_execution_sdk_python.config import (
-    ProcessorResponseMode,
-)
 from aws_durable_execution_sdk_python.dmap.handlers import (
+    ItemFailure,
     ReaderPage,
     distributed_map_batch_handler,
     distributed_map_item_handler,
     durable_distributed_map_item_handler,
     distributed_map_reader,
 )
-from aws_durable_execution_sdk_python.exceptions import ValidationError
-
-
-def test_item_handler_rejects_batch_response_mode():
-    with pytest.raises(ValidationError, match="response_mode must be"):
-        distributed_map_item_handler(
-            lambda x: x, response_mode=ProcessorResponseMode.BATCH
-        )
-
-
-def test_durable_item_handler_rejects_batch_response_mode():
-    with pytest.raises(ValidationError, match="response_mode must be"):
-        durable_distributed_map_item_handler(
-            lambda _ctx, item: item, response_mode=ProcessorResponseMode.BATCH
-        )
+from aws_durable_execution_sdk_python.exceptions import SerDesError, ValidationError
+from aws_durable_execution_sdk_python.lambda_service import ErrorObject
+from aws_durable_execution_sdk_python.serdes import SerDes, SerDesContext
 
 
 def test_item_handler_rejects_concurrency_below_one():
@@ -125,22 +113,102 @@ def test_item_handler_captures_failures():
     ]
 
 
-def test_item_handler_failures_form_reports_only_failures():
-    handler = distributed_map_item_handler(
-        lambda x: x, response_mode=ProcessorResponseMode.ITEM_FAILURES
-    )
+def test_item_handler_reports_every_member_of_a_rich_error():
+    """An error carrying data and a stack trace reaches the service with all four members."""
+
+    def process(_x: Any) -> Any:
+        raise SerDesError(
+            message="bad payload",
+            error_type="ignored, SerDesError pins its own type",
+            data="payload",
+            stack_trace=["frame one", "frame two"],
+        )
+
+    handler = distributed_map_item_handler(process)
     resp = handler({"records": [{"itemId": "0", "body": "1"}]})
-    assert resp == {"batchItemFailures": []}
+
+    error = resp["batchItemFailures"][0]["error"]
+    assert error["errorMessage"] == "bad payload"
+    assert error["errorData"] == "payload"
+    assert error["stackTrace"] == ["frame one", "frame two"]
+
+
+def test_item_handler_omits_error_members_the_exception_lacks():
+    """A plain exception carries no data or trace, so neither key is written."""
+
+    def process(_x: Any) -> Any:
+        msg = "boom"
+        raise ValueError(msg)
+
+    handler = distributed_map_item_handler(process)
+    resp = handler({"records": [{"itemId": "0", "body": "1"}]})
+
+    assert resp["batchItemFailures"][0]["error"] == {
+        "errorType": "ValueError",
+        "errorMessage": "boom",
+    }
+
+
+def test_item_failure_wire_round_trip_keeps_every_member():
+    failure = ItemFailure(
+        item_identifier="7",
+        error=ErrorObject(
+            message="boom", type="E", data="payload", stack_trace=["frame"]
+        ),
+    )
+    parsed = ItemFailure.from_dict(failure.to_dict())
+    assert parsed == failure
+
+
+def test_item_handler_omits_the_output_of_a_handler_returning_none():
+    handler = distributed_map_item_handler(lambda _x: None)
+    resp = handler({"records": [{"itemId": "0", "body": "1"}]})
+    assert resp == {
+        "batchItemFailures": [],
+        "batchItemResults": [{"itemIdentifier": "0"}],
+    }
+
+
+def test_item_handler_fails_only_the_item_whose_output_cannot_be_serialized():
+    """A result serdes failure is that item's failure, not the batch's."""
+
+    class _RejectsBad(SerDes[Any]):
+        def serialize(self, value: Any, _serdes_context: SerDesContext) -> str:
+            if value == "bad":
+                msg = "cannot serialize"
+                raise TypeError(msg)
+            return json.dumps(value)
+
+        def deserialize(self, data: str, _serdes_context: SerDesContext) -> Any:
+            return json.loads(data)
+
+    handler = distributed_map_item_handler(lambda x: x, result_serdes=_RejectsBad())
+    resp = handler(
+        {"records": [{"itemId": "0", "body": '"ok"'}, {"itemId": "1", "body": '"bad"'}]}
+    )
+    assert resp["batchItemResults"] == [{"itemIdentifier": "0", "output": '"ok"'}]
+    assert resp["batchItemFailures"] == [
+        {
+            "itemIdentifier": "1",
+            "error": {"errorType": "TypeError", "errorMessage": "cannot serialize"},
+        }
+    ]
 
 
 def test_batch_handler_success_and_propagates_error():
     seen: list = []
-    handler = distributed_map_batch_handler(lambda items: seen.extend(items) or "done")
+
+    def process(items):
+        seen.extend(items)
+        return "ignored"
+
+    handler = distributed_map_batch_handler(process)
+    # A batch processor reports no output, so the return value is not forwarded.
     assert (
         handler(
             {"records": [{"itemId": "0", "body": "1"}, {"itemId": "1", "body": "2"}]}
         )
-        == "done"
+        is None
     )
     assert seen == [1, 2]
 
@@ -161,12 +229,64 @@ def test_reader_returns_items_and_next_state_then_exhausts():
 
     handler = distributed_map_reader(read)
     first = handler({"state": None, "maxItemsPerPage": 10})
-    assert first["items"] == [1, 2]
+    assert first["items"] == ["1", "2"]
     assert first["nextState"] == '{"page": 1}'
 
     second = handler({"state": '{"page": 1}', "maxItemsPerPage": 10})
-    assert second["items"] == [3]
+    assert second["items"] == ["3"]
     assert "nextState" not in second
+
+
+def test_reader_serializes_items_with_the_item_serdes():
+    """An item serdes encodes each item, so the processor's can decode it."""
+
+    class _UpperSerDes(SerDes[Any]):
+        def serialize(self, value: Any, _serdes_context: SerDesContext) -> str:
+            return json.dumps(value.upper())
+
+        def deserialize(self, data: str, _serdes_context: SerDesContext) -> Any:
+            return json.loads(data).lower()
+
+    serdes = _UpperSerDes()
+    reader = distributed_map_reader(
+        lambda _s, _max: ReaderPage(items=["a", "b"]), item_serdes=serdes
+    )
+    page = reader({"state": None, "maxItemsPerPage": 10})
+    assert page["items"] == ['"A"', '"B"']
+
+    seen = []
+    processor = distributed_map_batch_handler(seen.extend, item_serdes=serdes)
+    processor(
+        {
+            "records": [
+                {"itemId": str(i), "body": body} for i, body in enumerate(page["items"])
+            ]
+        }
+    )
+    assert seen == ["a", "b"]
+
+
+def test_reader_item_serdes_is_separate_from_the_state_serdes():
+    """Items use the item serdes and next_state uses the state serdes."""
+
+    class _PrefixSerDes(SerDes[Any]):
+        def __init__(self, prefix: str) -> None:
+            self.prefix = prefix
+
+        def serialize(self, value: Any, _serdes_context: SerDesContext) -> str:
+            return self.prefix + json.dumps(value)
+
+        def deserialize(self, data: str, _serdes_context: SerDesContext) -> Any:
+            return json.loads(data.removeprefix(self.prefix))
+
+    handler = distributed_map_reader(
+        lambda state, _max: ReaderPage(items=[state], next_state="s"),
+        item_serdes=_PrefixSerDes("item:"),
+        state_serdes=_PrefixSerDes("state:"),
+    )
+    page = handler({"state": 'state:"in"', "maxItemsPerPage": 10})
+    assert page["items"] == ['item:"in"']
+    assert page["nextState"] == 'state:"s"'
 
 
 def test_reader_receives_the_page_bound():
@@ -174,7 +294,7 @@ def test_reader_receives_the_page_bound():
     handler = distributed_map_reader(
         lambda _s, max_items_per_page: ReaderPage(items=list(range(max_items_per_page)))
     )
-    assert handler({"state": None, "maxItemsPerPage": 3})["items"] == [0, 1, 2]
+    assert handler({"state": None, "maxItemsPerPage": 3})["items"] == ["0", "1", "2"]
 
 
 def test_reader_rejects_page_over_max_items_per_page():

@@ -52,7 +52,6 @@ from aws_durable_execution_sdk_python.identifier import (
     OperationIdNamespace,
 )
 from aws_durable_execution_sdk_python.lambda_service import (
-    _MAX_CONCURRENCY_LIMIT,
     OperationSubType,
     OperationType,
 )
@@ -732,7 +731,8 @@ class DurableContext(DurableContextProtocol):
         Args:
             source: The items to process (a typed source or a plain-list shorthand)
             processor: The processor configuration built via a DistributedMapProcessor factory
-            max_concurrency: Maximum concurrent processor invocations
+            max_concurrency: Maximum concurrent processor invocations. Required,
+                with no service default.
             name: Optional name for the operation
             config: Optional run-level configuration
 
@@ -743,11 +743,8 @@ class DurableContext(DurableContextProtocol):
         if not isinstance(source, (DistributedMapSource, list, tuple)):
             msg = "source must be a DistributedMapSource or a list/tuple of items"
             raise ValidationError(msg)
-        if not 1 <= max_concurrency <= _MAX_CONCURRENCY_LIMIT:
-            msg = (
-                f"max_concurrency must be between 1 and {_MAX_CONCURRENCY_LIMIT}, "
-                f"got: {max_concurrency}"
-            )
+        if max_concurrency < 1:
+            msg = f"max_concurrency must be greater than zero, got: {max_concurrency}"
             raise ValidationError(msg)
         if config is None:
             config = DistributedMapConfig()

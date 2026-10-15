@@ -11,12 +11,13 @@ from aws_durable_execution_sdk_python.config import (
     DistributedMapSource,
 )
 from aws_durable_execution_sdk_python.dmap.models import (
-    DistributedMapItemError,
     DistributedMapResult,
     DistributedMapResultItem,
     DistributedMapSummary,
 )
 from aws_durable_execution_sdk_python.exceptions import (
+    INVALID_PARAMETER_VALUE_EXCEPTION,
+    CheckpointError,
     ExecutionError,
     ValidationError,
 )
@@ -65,6 +66,21 @@ logger = logging.getLogger(__name__)
 # Size limits for the inline item list (1 MB) and the reader's saved state (32 KB).
 _INLINE_SIZE_LIMIT = 1024 * 1024
 _READER_STATE_LIMIT = 32 * 1024
+
+
+def _rejected_config_error(error: CheckpointError) -> Exception:
+    """Return the error to raise for a rejected START checkpoint.
+
+    The service rejects an invalid configuration with
+    ``InvalidParameterValueException``, which the caller must see as a
+    ``ValidationError`` whether the SDK or the service caught it. A retryable
+    rejection is a stale checkpoint token rather than a bad configuration, so it
+    is left as it is.
+    """
+    code = error.error.get("Code") if error.error else None
+    if code == INVALID_PARAMETER_VALUE_EXCEPTION and not error.is_retryable():
+        return ValidationError(str(error))
+    return error
 
 
 class DistributedMapOperationExecutor(OperationExecutor[DistributedMapSummary]):
@@ -172,7 +188,7 @@ class DistributedMapOperationExecutor(OperationExecutor[DistributedMapSummary]):
             source=self._build_source_config(),
             processor=DistributedMapProcessorConfig.from_processor(self.processor),
             destination=(
-                DistributedMapDestinationConfig.from_config(config.destination)
+                DistributedMapDestinationConfig.from_destination(config.destination)
                 if config.destination is not None
                 else None
             ),
@@ -219,20 +235,12 @@ class DistributedMapOperationExecutor(OperationExecutor[DistributedMapSummary]):
                     operation_id=self.operation_identifier.operation_id,
                     durable_execution_arn=self.state.durable_execution_arn,
                 )
-            error = (
-                DistributedMapItemError(
-                    error_type=entry.error.type or "",
-                    error_message=entry.error.message or "",
-                )
-                if entry.error is not None
-                else None
-            )
             items.append(
                 DistributedMapResultItem(
                     item_id=entry.item_id,
                     status=entry.status,
                     output=output,
-                    error=error,
+                    error=entry.error,
                 )
             )
         return items
@@ -297,7 +305,12 @@ class DistributedMapOperationExecutor(OperationExecutor[DistributedMapSummary]):
             )
             # Checkpoint map run START with blocking (is_sync=True).
             # Must ensure the map run is recorded before suspending execution.
-            self.state.create_checkpoint(operation_update=start_operation, is_sync=True)
+            try:
+                self.state.create_checkpoint(
+                    operation_update=start_operation, is_sync=True
+                )
+            except CheckpointError as e:
+                raise _rejected_config_error(e) from e
 
             logger.debug(
                 "🚀 Map run %s started, will check for immediate completion",

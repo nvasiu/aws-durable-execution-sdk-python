@@ -3,26 +3,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, NoReturn
+from typing import TYPE_CHECKING, Any, Self, TypedDict
 
 from aws_durable_execution_sdk_python.exceptions import (
     DistributedMapError,
     ExecutionError,
-    ValidationError,
 )
 from aws_durable_execution_sdk_python.config import (
-    DistributedMapCompletionReason,
     DistributedMapItemStatus,
     DistributedMapStatus,
 )
-from aws_durable_execution_sdk_python.lambda_service import OperationStatus
+from aws_durable_execution_sdk_python.lambda_service import ErrorObject, OperationStatus
 from aws_durable_execution_sdk_python.types import DurableExecutionArn
 
 if TYPE_CHECKING:
-    from aws_durable_execution_sdk_python.lambda_service import (
-        DistributedMapDetails,
-        Operation,
-    )
+    from aws_durable_execution_sdk_python.lambda_service import Operation
 
 _STATUS_FOR_OPERATION_STATUS = {
     OperationStatus.SUCCEEDED: DistributedMapStatus.SUCCEEDED,
@@ -47,22 +42,52 @@ def _to_distributed_map_status(operation: Operation | None) -> DistributedMapSta
     return resolved
 
 
-def _resolve_terminal(
-    operation: Operation | None,
-) -> tuple[DistributedMapDetails, DistributedMapStatus, DistributedMapCompletionReason]:
-    """Read the details, status and completion reason a terminal operation must carry."""
+class _SummaryFields(TypedDict):
+    """The summary fields both factories pass to the constructor."""
+
+    status: DistributedMapStatus
+    success_count: int
+    failure_count: int
+    unprocessed_count: int
+    distributed_map_run_arn: str | None
+    source_exhausted: bool | None
+    error: ErrorObject | None
+    total_count: int | None
+
+
+def _summary_fields(operation: Operation | None) -> _SummaryFields:
+    """Read the summary fields a terminal operation must carry."""
     details = operation.distributed_map_details if operation else None
     if details is None:
-        msg = "DISTRIBUTED_MAP operation succeeded but carried no DistributedMapDetails"
-        raise ExecutionError(msg)
-    status = _to_distributed_map_status(operation)
-    if details.completion_reason is None:
+        # The raw operation status, not _to_distributed_map_status, which raises
+        # on a non-terminal status and would replace this error with its own.
+        op_status = (
+            operation.status.value if operation and operation.status else "UNKNOWN"
+        )
         msg = (
-            f"DISTRIBUTED_MAP operation ended {status.value} but carried no "
-            f"CompletionReason"
+            f"DISTRIBUTED_MAP operation ended {op_status} but carried no "
+            f"DistributedMapDetails"
         )
         raise ExecutionError(msg)
-    return details, status, details.completion_reason
+    status = _to_distributed_map_status(operation)
+    # SourceExhausted is required at terminal once a run exists, and is absent
+    # only when the operation failed before one was created.
+    if details.distributed_map_run_arn is not None and details.source_exhausted is None:
+        msg = (
+            f"DISTRIBUTED_MAP operation ended {status.value} but carried no "
+            f"SourceExhausted"
+        )
+        raise ExecutionError(msg)
+    return {
+        "status": status,
+        "success_count": details.success_count,
+        "failure_count": details.failure_count,
+        "unprocessed_count": details.unprocessed_count,
+        "distributed_map_run_arn": details.distributed_map_run_arn,
+        "source_exhausted": details.source_exhausted,
+        "error": details.error,
+        "total_count": details.total_count,
+    }
 
 
 _RUN_ARN_SEPARATOR = "/distributed-map-run/"
@@ -98,28 +123,22 @@ class DistributedMapSummary:
     """
 
     status: DistributedMapStatus
-    completion_reason: DistributedMapCompletionReason
     success_count: int
     failure_count: int
     unprocessed_count: int
     distributed_map_run_arn: str | None = None
-    completion_details: str | None = None
+    source_exhausted: bool | None = None
+    error: ErrorObject | None = None
     total_count: int | None = None
 
     @classmethod
-    def from_operation(cls, operation: Operation | None) -> DistributedMapSummary:
-        """Rebuild the summary from a terminal DISTRIBUTED_MAP operation."""
-        details, status, completion_reason = _resolve_terminal(operation)
-        return cls(
-            status=status,
-            completion_reason=completion_reason,
-            success_count=details.success_count,
-            failure_count=details.failure_count,
-            unprocessed_count=details.unprocessed_count,
-            distributed_map_run_arn=details.distributed_map_run_arn,
-            completion_details=details.completion_details,
-            total_count=details.total_count,
-        )
+    def from_operation(cls, operation: Operation | None) -> Self:
+        """Rebuild the summary from a terminal DISTRIBUTED_MAP operation.
+
+        Called on :class:`DistributedMapResult` this returns a result whose
+        ``all`` is empty, which is the correct value for a run with no items.
+        """
+        return cls(**_summary_fields(operation))
 
     @property
     def distributed_map_id(self) -> str | None:
@@ -137,25 +156,21 @@ class DistributedMapSummary:
     def throw_if_error(self) -> None:
         """Raise :class:`DistributedMapError` on any non-success outcome."""
         if self.status is not DistributedMapStatus.SUCCEEDED:
-            detail = f", {self.completion_details}" if self.completion_details else ""
-            msg = (
-                f"Map run ended {self.status.value} "
-                f"(reason: {self.completion_reason.value}{detail})"
+            error = self.error
+            msg = f"Map run ended {self.status.value}"
+            if error is not None and error.message:
+                msg = f"{msg}: {error.message}"
+            raise DistributedMapError(
+                message=msg,
+                error_type=error.type if error else None,
+                data=error.data if error else None,
+                stack_trace=error.stack_trace if error else None,
             )
-            raise DistributedMapError(msg)
         if self.failure_count > 0:
             msg = (
                 f"Map run succeeded but {self.failure_count} item(s) permanently failed"
             )
             raise DistributedMapError(msg)
-
-
-@dataclass(frozen=True)
-class DistributedMapItemError:
-    """Error for a single failed map run item."""
-
-    error_type: str
-    error_message: str
 
 
 @dataclass(frozen=True)
@@ -165,7 +180,7 @@ class DistributedMapResultItem:
     item_id: str
     status: DistributedMapItemStatus
     output: Any | None = None
-    error: DistributedMapItemError | None = None
+    error: ErrorObject | None = None
 
 
 @dataclass(frozen=True)
@@ -180,33 +195,11 @@ class DistributedMapResult(DistributedMapSummary):
     all: list[DistributedMapResultItem] = field(default_factory=list)
 
     @classmethod
-    def from_operation(cls, operation: Operation | None) -> NoReturn:
-        """Always raises. Use :meth:`from_operation_and_items` instead."""
-        msg = (
-            "DistributedMapResult carries per-item results, which from_operation "
-            "cannot supply. Call DistributedMapResult.from_operation_and_items "
-            "with the deserialized items, or DistributedMapSummary.from_operation "
-            "for the counts alone."
-        )
-        raise ValidationError(msg)
-
-    @classmethod
     def from_operation_and_items(
         cls, operation: Operation | None, items: list[DistributedMapResultItem]
-    ) -> DistributedMapResult:
+    ) -> Self:
         """Rebuild the result from a terminal operation and its deserialized items."""
-        details, status, completion_reason = _resolve_terminal(operation)
-        return cls(
-            status=status,
-            completion_reason=completion_reason,
-            success_count=details.success_count,
-            failure_count=details.failure_count,
-            unprocessed_count=details.unprocessed_count,
-            distributed_map_run_arn=details.distributed_map_run_arn,
-            completion_details=details.completion_details,
-            total_count=details.total_count,
-            all=items,
-        )
+        return cls(**_summary_fields(operation), all=items)
 
     def succeeded(self) -> list[DistributedMapResultItem]:
         """Return the items that succeeded."""
@@ -223,20 +216,19 @@ class DistributedMapResult(DistributedMapSummary):
         ]
 
     def get_results(self) -> list[Any]:
-        """Return the outputs of the succeeded items."""
+        """Return one output per succeeded item, None where none was recorded."""
         return [
             item.output
             for item in self.all
             if item.status is DistributedMapItemStatus.SUCCEEDED
-            and item.output is not None
         ]
 
-    def get_errors(self) -> list[DistributedMapItemError]:
-        """Return the errors of the failed items."""
+    def get_errors(self) -> list[ErrorObject | None]:
+        """Return one error per failed item, None where none was recorded."""
         return [
             item.error
             for item in self.all
-            if item.status is DistributedMapItemStatus.FAILED and item.error is not None
+            if item.status is DistributedMapItemStatus.FAILED
         ]
 
     def throw_if_error(self) -> None:
@@ -245,9 +237,14 @@ class DistributedMapResult(DistributedMapSummary):
             failed = self.failed()
             if failed:
                 first = failed[0]
-                if first.error is not None:
-                    msg = f"{first.error.error_type}: {first.error.error_message}"
-                    raise DistributedMapError(msg)
+                error = first.error
+                if error is not None:
+                    raise DistributedMapError(
+                        message=f"{error.type}: {error.message}",
+                        error_type=error.type,
+                        data=error.data,
+                        stack_trace=error.stack_trace,
+                    )
                 msg = f"item {first.item_id} failed"
                 raise DistributedMapError(msg)
         super().throw_if_error()

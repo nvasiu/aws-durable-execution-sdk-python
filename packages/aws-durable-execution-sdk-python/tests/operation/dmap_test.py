@@ -13,7 +13,6 @@ from aws_durable_execution_sdk_python.dmap.models import (
 )
 from aws_durable_execution_sdk_python.config import (
     Duration,
-    DistributedMapCompletionReason,
     DistributedMapItemStatus,
     DistributedMapStatus,
     DistributedMapCompletionConfig,
@@ -28,7 +27,9 @@ from aws_durable_execution_sdk_python.config import (
 )
 from aws_durable_execution_sdk_python.exceptions import (
     ExecutionError,
+    CheckpointError,
     DistributedMapError,
+    DurableApiErrorCategory,
     NonDeterministicExecutionError,
     SuspendExecution,
     ValidationError,
@@ -66,7 +67,7 @@ def distributed_map_handler(
     if not config:
         config = DistributedMapConfig()
     if isinstance(processor, str):
-        processor = DistributedMapProcessor.batch(processor)
+        processor = DistributedMapProcessor.report_batch_outcome(processor)
     executor = DistributedMapOperationExecutor(
         source=source,
         processor=processor,
@@ -98,7 +99,7 @@ def test_map_run_handler_already_succeeded():
         name="test_map_run",
         status=OperationStatus.SUCCEEDED,
         distributed_map_details=DistributedMapDetails(
-            completion_reason=DistributedMapCompletionReason.ALL_COMPLETED,
+            source_exhausted=True,
             success_count=5,
             failure_count=0,
             unprocessed_count=0,
@@ -119,7 +120,8 @@ def test_map_run_handler_already_succeeded():
     )
 
     assert result.status is DistributedMapStatus.SUCCEEDED
-    assert result.completion_reason is DistributedMapCompletionReason.ALL_COMPLETED
+    assert result.source_exhausted is True
+    assert result.error is None
     assert result.success_count == 5
     assert result.failure_count == 0
     assert result.total_count == 5
@@ -143,10 +145,17 @@ def test_map_run_handler_resolves_non_success_without_raising():
         name="test_map_run",
         status=OperationStatus.FAILED,
         distributed_map_details=DistributedMapDetails(
-            completion_reason=DistributedMapCompletionReason.FAILURE_TOLERANCE_EXCEEDED,
+            source_exhausted=False,
+            error=ErrorObject(
+                message="failure tolerance exceeded",
+                type="DistributedMapFailure",
+                data=None,
+                stack_trace=None,
+            ),
             success_count=3,
             failure_count=2,
             unprocessed_count=1,
+            distributed_map_run_arn="arn:aws:lambda:us-east-1:123456789012:function:fn:$LATEST/durable-execution/exec1/invoke1/distributed-map-run/abc",
         ),
     )
     mock_state.get_checkpoint_result.return_value = (
@@ -162,10 +171,9 @@ def test_map_run_handler_resolves_non_success_without_raising():
     )
 
     assert result.status is DistributedMapStatus.FAILED
-    assert (
-        result.completion_reason
-        is DistributedMapCompletionReason.FAILURE_TOLERANCE_EXCEEDED
-    )
+    assert result.source_exhausted is False
+    assert result.error is not None
+    assert result.error.message == "failure tolerance exceeded"
     assert result.failure_count == 2
     assert result.has_failure is True
 
@@ -370,7 +378,7 @@ def test_map_run_immediate_response_immediate_success():
         name="test_map_run",
         status=OperationStatus.SUCCEEDED,
         distributed_map_details=DistributedMapDetails(
-            completion_reason=DistributedMapCompletionReason.ALL_COMPLETED,
+            source_exhausted=True,
             success_count=1,
         ),
     )
@@ -432,7 +440,7 @@ def test_map_run_immediate_response_already_completed():
         name="test_map_run",
         status=OperationStatus.SUCCEEDED,
         distributed_map_details=DistributedMapDetails(
-            completion_reason=DistributedMapCompletionReason.ALL_COMPLETED,
+            source_exhausted=True,
         ),
     )
     mock_state.get_checkpoint_result.return_value = (
@@ -450,6 +458,63 @@ def test_map_run_immediate_response_already_completed():
     assert result.status is DistributedMapStatus.SUCCEEDED
     mock_state.create_checkpoint.assert_not_called()
     assert mock_state.get_checkpoint_result.call_count == 1
+
+
+def _rejecting_state(error: CheckpointError) -> Mock:
+    """A state whose START checkpoint is rejected with the given error."""
+    mock_state = Mock(spec=ExecutionState)
+    mock_state.durable_execution_arn = "test_arn"
+    mock_state.get_checkpoint_result.return_value = (
+        CheckpointedResult.create_not_found()
+    )
+    mock_state.create_checkpoint.side_effect = error
+    return mock_state
+
+
+def _start(mock_state: Mock) -> DistributedMapSummary:
+    return distributed_map_handler(
+        source=["a"],
+        processor="p",
+        max_concurrency=1,
+        state=mock_state,
+        operation_identifier=_identifier("mrv"),
+    )
+
+
+def test_rejected_configuration_raises_validation_error():
+    """A configuration the service rejects surfaces as ValidationError, as the spec requires."""
+    error = CheckpointError(
+        "Source.MaxItemsToRead is out of range",
+        error_category=DurableApiErrorCategory.EXECUTION,
+        error={"Code": "InvalidParameterValueException", "Message": "bad config"},
+    )
+    with pytest.raises(ValidationError, match="MaxItemsToRead"):
+        _start(_rejecting_state(error))
+
+
+def test_stale_checkpoint_token_stays_a_checkpoint_error():
+    """A retryable InvalidParameterValueException is a stale token, not a bad configuration."""
+    error = CheckpointError(
+        "Invalid checkpoint token",
+        error_category=DurableApiErrorCategory.INVOCATION,
+        error={
+            "Code": "InvalidParameterValueException",
+            "Message": "Invalid checkpoint token",
+        },
+    )
+    with pytest.raises(CheckpointError):
+        _start(_rejecting_state(error))
+
+
+def test_other_checkpoint_failures_stay_checkpoint_errors():
+    """Only an invalid configuration is remapped; every other rejection passes through."""
+    error = CheckpointError(
+        "throttled",
+        error_category=DurableApiErrorCategory.INVOCATION,
+        error={"Code": "TooManyRequestsException", "Message": "slow down"},
+    )
+    with pytest.raises(CheckpointError):
+        _start(_rejecting_state(error))
 
 
 @patch(
@@ -526,19 +591,31 @@ def _new_op_state_calls():
     return [not_found, started]
 
 
-def test_processor_item_failures_sets_response_types():
-    """item_failures serializes FunctionResponseTypes=REPORT_BATCH_ITEM_FAILURES."""
+def test_processor_item_outcomes_sets_response_types():
+    """report_item_outcomes serializes FunctionResponseTypes=REPORT_BATCH_ITEM_OUTCOMES."""
     options = _start_options(
         _new_op_state_calls(),
         source=["a"],
-        processor=DistributedMapProcessor.item_failures("proc", batch_size=25),
+        processor=DistributedMapProcessor.report_item_outcomes("proc", batch_size=25),
         max_concurrency=4,
         config=DistributedMapConfig(),
     )
     processor = options["Processor"]
     assert processor["FunctionName"] == "proc"
-    assert processor["FunctionResponseTypes"] == ["REPORT_BATCH_ITEM_FAILURES"]
+    assert processor["FunctionResponseTypes"] == ["REPORT_BATCH_ITEM_OUTCOMES"]
     assert processor["BatchSize"] == 25
+
+
+def test_processor_batch_outcome_sets_no_response_types():
+    """report_batch_outcome omits FunctionResponseTypes, selecting default batch mode."""
+    options = _start_options(
+        _new_op_state_calls(),
+        source=["a"],
+        processor=DistributedMapProcessor.report_batch_outcome("proc"),
+        max_concurrency=4,
+        config=DistributedMapConfig(),
+    )
+    assert "FunctionResponseTypes" not in options["Processor"]
 
 
 def test_processor_unlimited_retries_maps_to_negative_one():
@@ -546,7 +623,7 @@ def test_processor_unlimited_retries_maps_to_negative_one():
     options = _start_options(
         _new_op_state_calls(),
         source=["a"],
-        processor=DistributedMapProcessor.item_results(
+        processor=DistributedMapProcessor.report_item_outcomes(
             "proc",
             max_retry_attempts=DistributedMapProcessor.UNLIMITED,
             max_retry_duration=Duration.from_hours(1),
@@ -555,7 +632,7 @@ def test_processor_unlimited_retries_maps_to_negative_one():
         config=DistributedMapConfig(),
     )
     processor = options["Processor"]
-    assert processor["FunctionResponseTypes"] == ["REPORT_BATCH_ITEM_RESULTS"]
+    assert processor["FunctionResponseTypes"] == ["REPORT_BATCH_ITEM_OUTCOMES"]
     assert processor["MaxRetryAttempts"] == -1
     assert processor["MaxRetryDurationSeconds"] == 3600
 
@@ -565,7 +642,9 @@ def test_processor_explicit_retry_attempts_pass_through():
     options = _start_options(
         _new_op_state_calls(),
         source=["a"],
-        processor=DistributedMapProcessor.batch("proc", max_retry_attempts=0),
+        processor=DistributedMapProcessor.report_batch_outcome(
+            "proc", max_retry_attempts=0
+        ),
         max_concurrency=1,
         config=DistributedMapConfig(),
     )
@@ -581,16 +660,20 @@ def test_s3_source_serializes_config():
         source=DistributedMapSource.s3_json_lines(
             "s3://bucket/data.jsonl", max_items=500
         ),
-        processor=DistributedMapProcessor.batch("proc"),
+        processor=DistributedMapProcessor.report_batch_outcome("proc"),
         max_concurrency=2,
         config=DistributedMapConfig(),
     )
     source = options["Source"]
     assert source["Type"] == "S3"
     assert source["MaxItemsToRead"] == 500
-    assert source["S3SourceConfig"]["Bucket"] == "bucket"
-    assert source["S3SourceConfig"]["Key"] == "data.jsonl"
-    assert source["S3SourceConfig"]["Format"] == "JSON_LINES"
+    s3 = source["S3SourceConfig"]
+    assert s3["Type"] == "OBJECT"
+    assert s3["Bucket"] == "bucket"
+    assert s3["ObjectConfig"]["Key"] == "data.jsonl"
+    assert s3["ObjectConfig"]["Format"] == "JSON_LINES"
+    assert "ListedObjectMetadataConfig" not in s3
+    assert "ListedObjectsConfig" not in s3
 
 
 def test_full_config_serializes_all_blocks():
@@ -608,7 +691,7 @@ def test_full_config_serializes_all_blocks():
     options = _start_options(
         _new_op_state_calls(),
         source=["a"],
-        processor=DistributedMapProcessor.item_results("proc"),
+        processor=DistributedMapProcessor.report_item_outcomes("proc"),
         max_concurrency=8,
         config=config,
     )
@@ -639,7 +722,7 @@ def test_result_config_returns_map_run_result_with_items():
         name="test_map_run",
         status=OperationStatus.SUCCEEDED,
         distributed_map_details=DistributedMapDetails(
-            completion_reason=DistributedMapCompletionReason.ALL_COMPLETED,
+            source_exhausted=True,
             success_count=1,
             failure_count=1,
             unprocessed_count=0,
@@ -660,7 +743,7 @@ def test_result_config_returns_map_run_result_with_items():
 
     result = distributed_map_handler(
         source=["a", "b"],
-        processor=DistributedMapProcessor.item_results("proc"),
+        processor=DistributedMapProcessor.report_item_outcomes("proc"),
         max_concurrency=2,
         state=mock_state,
         operation_identifier=_identifier("mrr"),
@@ -672,8 +755,110 @@ def test_result_config_returns_map_run_result_with_items():
     assert result.get_results() == [42]
     errors = result.get_errors()
     assert len(errors) == 1
-    assert errors[0].error_type == "ItemError"
-    assert errors[0].error_message == "boom"
+    assert errors[0].type == "ItemError"
+    assert errors[0].message == "boom"
+
+
+def test_item_error_keeps_every_error_member():
+    """An item's error reaches the caller as the full ErrorObject, data and trace included."""
+    mock_state = Mock(spec=ExecutionState)
+    mock_state.durable_execution_arn = "test_arn"
+    operation = Operation(
+        operation_id="mre",
+        operation_type=OperationType.DISTRIBUTED_MAP,
+        sub_type=OperationSubType.DISTRIBUTED_MAP,
+        name="test_map_run",
+        status=OperationStatus.SUCCEEDED,
+        distributed_map_details=DistributedMapDetails(
+            source_exhausted=True,
+            success_count=0,
+            failure_count=1,
+            unprocessed_count=0,
+            total_count=1,
+            results=(
+                DistributedMapResultItemApi(
+                    item_id="0",
+                    status=DistributedMapItemStatus.FAILED,
+                    error=ErrorObject(
+                        message="boom",
+                        type="ItemError",
+                        data="payload",
+                        stack_trace=["frame one", "frame two"],
+                    ),
+                ),
+            ),
+        ),
+    )
+    mock_state.get_checkpoint_result.return_value = (
+        CheckpointedResult.create_from_operation(operation)
+    )
+
+    result = distributed_map_handler(
+        source=["a"],
+        processor=DistributedMapProcessor.report_item_outcomes("proc"),
+        max_concurrency=1,
+        state=mock_state,
+        operation_identifier=_identifier("mre"),
+        config=DistributedMapResultConfig(),
+    )
+
+    error = result.get_errors()[0]
+    assert error is not None
+    assert error.data == "payload"
+    assert error.stack_trace == ["frame one", "frame two"]
+
+    # The raised item failure carries the same members.
+    with pytest.raises(DistributedMapError) as exc:
+        result.throw_if_error()
+    assert exc.value.error_type == "ItemError"
+    assert exc.value.data == "payload"
+    assert exc.value.stack_trace == ["frame one", "frame two"]
+
+
+def test_item_error_members_absent_from_the_backend_stay_none():
+    """An omitted error member stays None rather than becoming an empty string."""
+    mock_state = Mock(spec=ExecutionState)
+    mock_state.durable_execution_arn = "test_arn"
+    operation = Operation(
+        operation_id="mren",
+        operation_type=OperationType.DISTRIBUTED_MAP,
+        sub_type=OperationSubType.DISTRIBUTED_MAP,
+        name="test_map_run",
+        status=OperationStatus.SUCCEEDED,
+        distributed_map_details=DistributedMapDetails(
+            source_exhausted=True,
+            success_count=0,
+            failure_count=1,
+            unprocessed_count=0,
+            total_count=1,
+            results=(
+                DistributedMapResultItemApi(
+                    item_id="0",
+                    status=DistributedMapItemStatus.FAILED,
+                    error=ErrorObject(
+                        message=None, type=None, data=None, stack_trace=None
+                    ),
+                ),
+            ),
+        ),
+    )
+    mock_state.get_checkpoint_result.return_value = (
+        CheckpointedResult.create_from_operation(operation)
+    )
+
+    result = distributed_map_handler(
+        source=["a"],
+        processor=DistributedMapProcessor.report_item_outcomes("proc"),
+        max_concurrency=1,
+        state=mock_state,
+        operation_identifier=_identifier("mren"),
+        config=DistributedMapResultConfig(),
+    )
+
+    error = result.get_errors()[0]
+    assert error is not None
+    assert error.type is None
+    assert error.message is None
 
 
 def test_plain_config_returns_plain_summary():
@@ -687,7 +872,7 @@ def test_plain_config_returns_plain_summary():
         name="test_map_run",
         status=OperationStatus.SUCCEEDED,
         distributed_map_details=DistributedMapDetails(
-            completion_reason=DistributedMapCompletionReason.ALL_COMPLETED,
+            source_exhausted=True,
             success_count=2,
         ),
     )
@@ -697,7 +882,7 @@ def test_plain_config_returns_plain_summary():
 
     result = distributed_map_handler(
         source=["a", "b"],
-        processor=DistributedMapProcessor.batch("proc"),
+        processor=DistributedMapProcessor.report_batch_outcome("proc"),
         max_concurrency=2,
         state=mock_state,
         operation_identifier=_identifier("mrs"),
@@ -714,11 +899,11 @@ def test_csv_source_header_location():
     given = _start_options(
         _new_op_state_calls(),
         source=DistributedMapSource.s3_csv("s3://b/data.csv", headers=["a", "b"]),
-        processor=DistributedMapProcessor.batch("proc"),
+        processor=DistributedMapProcessor.report_batch_outcome("proc"),
         max_concurrency=1,
         config=DistributedMapConfig(),
     )
-    csv_opts = given["Source"]["S3SourceConfig"]["CsvFormatOptions"]
+    csv_opts = given["Source"]["S3SourceConfig"]["ObjectConfig"]["CsvFormatOptions"]
     assert csv_opts["HeaderLocation"] == "GIVEN"
     assert csv_opts["Headers"] == ["a", "b"]
     assert csv_opts["Delimiter"] == "COMMA"
@@ -727,13 +912,13 @@ def test_csv_source_header_location():
     first_row = _start_options(
         _new_op_state_calls(),
         source=DistributedMapSource.s3_csv("s3://b/data.csv"),
-        processor=DistributedMapProcessor.batch("proc"),
+        processor=DistributedMapProcessor.report_batch_outcome("proc"),
         max_concurrency=1,
         config=DistributedMapConfig(),
     )
-    s3_cfg = first_row["Source"]["S3SourceConfig"]
-    assert s3_cfg["CsvFormatOptions"]["HeaderLocation"] == "FIRST_ROW"
-    assert "Headers" not in s3_cfg["CsvFormatOptions"]
+    object_cfg = first_row["Source"]["S3SourceConfig"]["ObjectConfig"]
+    assert object_cfg["CsvFormatOptions"]["HeaderLocation"] == "FIRST_ROW"
+    assert "Headers" not in object_cfg["CsvFormatOptions"]
 
 
 # Call-site validation and serdes tests
@@ -746,11 +931,16 @@ def test_csv_delimiter_accepts_enum():
         source=DistributedMapSource.s3_csv(
             "s3://b/data.csv", delimiter=DistributedMapCsvDelimiter.PIPE
         ),
-        processor=DistributedMapProcessor.batch("proc"),
+        processor=DistributedMapProcessor.report_batch_outcome("proc"),
         max_concurrency=1,
         config=DistributedMapConfig(),
     )
-    assert opts["Source"]["S3SourceConfig"]["CsvFormatOptions"]["Delimiter"] == "PIPE"
+    assert (
+        opts["Source"]["S3SourceConfig"]["ObjectConfig"]["CsvFormatOptions"][
+            "Delimiter"
+        ]
+        == "PIPE"
+    )
 
 
 def test_inline_source_over_1mb_rejected():
@@ -759,7 +949,7 @@ def test_inline_source_over_1mb_rejected():
         _start_options(
             _new_op_state_calls(),
             source=big,
-            processor=DistributedMapProcessor.batch("proc"),
+            processor=DistributedMapProcessor.report_batch_outcome("proc"),
             max_concurrency=1,
             config=DistributedMapConfig(),
         )
@@ -772,7 +962,7 @@ def test_reader_state_serialized_and_capped():
         source=DistributedMapSource.reader_function(
             "reader", initial_state={"page": 0}
         ),
-        processor=DistributedMapProcessor.batch("proc"),
+        processor=DistributedMapProcessor.report_batch_outcome("proc"),
         max_concurrency=1,
         config=DistributedMapConfig(),
     )
@@ -787,7 +977,7 @@ def test_reader_state_serialized_and_capped():
             source=DistributedMapSource.reader_function(
                 "reader", initial_state="x" * 40_000
             ),
-            processor=DistributedMapProcessor.batch("proc"),
+            processor=DistributedMapProcessor.report_batch_outcome("proc"),
             max_concurrency=1,
             config=DistributedMapConfig(),
         )
@@ -807,7 +997,7 @@ def test_inline_custom_serdes_applied_to_items():
     options = _start_options(
         _new_op_state_calls(),
         source=DistributedMapSource.inline(["a", "b"], serdes=_UpperSerDes()),
-        processor=DistributedMapProcessor.batch("proc"),
+        processor=DistributedMapProcessor.report_batch_outcome("proc"),
         max_concurrency=1,
         config=DistributedMapConfig(),
     )
@@ -822,7 +1012,7 @@ def test_map_run_options_from_dict_round_trip():
     sent = _start_options(
         _new_op_state_calls(),
         source=["a", "b"],
-        processor=DistributedMapProcessor.batch("proc"),
+        processor=DistributedMapProcessor.report_batch_outcome("proc"),
         max_concurrency=7,
         config=DistributedMapConfig(),
     )
@@ -836,7 +1026,7 @@ def test_destination_only_success():
     opts = _start_options(
         _new_op_state_calls(),
         source=["a"],
-        processor=DistributedMapProcessor.batch("p"),
+        processor=DistributedMapProcessor.report_batch_outcome("p"),
         max_concurrency=1,
         config=DistributedMapConfig(
             destination=DistributedMapDestination(
@@ -853,7 +1043,7 @@ def test_destination_only_failure():
     opts = _start_options(
         _new_op_state_calls(),
         source=["a"],
-        processor=DistributedMapProcessor.batch("p"),
+        processor=DistributedMapProcessor.report_batch_outcome("p"),
         max_concurrency=1,
         config=DistributedMapConfig(
             destination=DistributedMapDestination(
@@ -870,27 +1060,29 @@ def test_s3_objects_source_config():
     opts = _start_options(
         _new_op_state_calls(),
         source=DistributedMapSource.s3_objects("s3://b/prefix/"),
-        processor=DistributedMapProcessor.batch("p"),
+        processor=DistributedMapProcessor.report_batch_outcome("p"),
         max_concurrency=1,
         config=DistributedMapConfig(),
     )
     s3 = opts["Source"]["S3SourceConfig"]
-    assert s3["Transform"] == "NONE"
-    assert s3["KeyPrefix"] == "prefix/"
-    assert "Format" not in s3
+    assert s3["Type"] == "LISTED_OBJECT_METADATA"
+    assert s3["ListedObjectMetadataConfig"]["KeyPrefix"] == "prefix/"
+    assert "ObjectConfig" not in s3
+    assert "ListedObjectsConfig" not in s3
 
 
 def test_s3_flattened_json_lines_source_config():
     opts = _start_options(
         _new_op_state_calls(),
         source=DistributedMapSource.s3_flattened_json_lines("s3://b/prefix/"),
-        processor=DistributedMapProcessor.batch("p"),
+        processor=DistributedMapProcessor.report_batch_outcome("p"),
         max_concurrency=1,
         config=DistributedMapConfig(),
     )
     s3 = opts["Source"]["S3SourceConfig"]
-    assert s3["Transform"] == "LOAD_AND_FLATTEN"
-    assert s3["Format"] == "JSON_LINES"
+    assert s3["Type"] == "LISTED_OBJECTS"
+    assert s3["ListedObjectsConfig"]["KeyPrefix"] == "prefix/"
+    assert s3["ListedObjectsConfig"]["Format"] == "JSON_LINES"
 
 
 # Validations, config branches, and round-trips
@@ -915,15 +1107,22 @@ def _start_executor(source, processor, config, max_concurrency=1):
 # --- Completion config translation ---
 
 
-def test_empty_completion_config_omitted():
+def test_completion_config_percentage_and_sample_size_sent():
     options = _start_options(
         _new_op_state_calls(),
         source=["a"],
-        processor=DistributedMapProcessor.batch("p"),
+        processor=DistributedMapProcessor.report_batch_outcome("p"),
         max_concurrency=1,
-        config=DistributedMapConfig(completion_config=DistributedMapCompletionConfig()),
+        config=DistributedMapConfig(
+            completion_config=DistributedMapCompletionConfig.failure_percentage(
+                25, minimum_sample_size=50
+            )
+        ),
     )
-    assert "CompletionConfig" not in options
+    assert options["CompletionConfig"] == {
+        "ToleratedFailurePercentage": 25,
+        "MinimumSampleSize": 50,
+    }
 
 
 # --- Source translation variants ---
@@ -933,14 +1132,14 @@ def test_objects_whole_bucket_prefix_config():
     options = _start_options(
         _new_op_state_calls(),
         source=DistributedMapSource.s3_objects("s3://bucket"),
-        processor=DistributedMapProcessor.batch("p"),
+        processor=DistributedMapProcessor.report_batch_outcome("p"),
         max_concurrency=1,
         config=DistributedMapConfig(),
     )
     s3 = options["Source"]["S3SourceConfig"]
-    assert s3["KeyPrefix"] == ""
-    assert s3["Transform"] == "NONE"
-    assert "Key" not in s3
+    assert s3["Type"] == "LISTED_OBJECT_METADATA"
+    assert s3["ListedObjectMetadataConfig"]["KeyPrefix"] == ""
+    assert "ObjectConfig" not in s3
 
 
 def test_flattened_csv_source_config():
@@ -949,22 +1148,21 @@ def test_flattened_csv_source_config():
         source=DistributedMapSource.s3_flattened_csv(
             "s3://b/prefix", headers=["a", "b"]
         ),
-        processor=DistributedMapProcessor.batch("p"),
+        processor=DistributedMapProcessor.report_batch_outcome("p"),
         max_concurrency=1,
         config=DistributedMapConfig(),
     )
-    s3 = options["Source"]["S3SourceConfig"]
-    assert s3["Transform"] == "LOAD_AND_FLATTEN"
-    assert s3["Format"] == "CSV"
-    assert s3["CsvFormatOptions"]["HeaderLocation"] == "GIVEN"
-    assert s3["CsvFormatOptions"]["Headers"] == ["a", "b"]
+    listed = options["Source"]["S3SourceConfig"]["ListedObjectsConfig"]
+    assert listed["Format"] == "CSV"
+    assert listed["CsvFormatOptions"]["HeaderLocation"] == "GIVEN"
+    assert listed["CsvFormatOptions"]["Headers"] == ["a", "b"]
 
 
 def test_reader_source_without_initial_state_omits_state():
     options = _start_options(
         _new_op_state_calls(),
         source=DistributedMapSource.reader_function("reader"),
-        processor=DistributedMapProcessor.batch("p"),
+        processor=DistributedMapProcessor.report_batch_outcome("p"),
         max_concurrency=1,
         config=DistributedMapConfig(),
     )
@@ -987,7 +1185,7 @@ def test_inline_non_json_serdes_supported():
     options = _start_options(
         _new_op_state_calls(),
         source=DistributedMapSource.inline([1, 2], serdes=_PlainTextSerDes()),
-        processor=DistributedMapProcessor.batch("p"),
+        processor=DistributedMapProcessor.report_batch_outcome("p"),
         max_concurrency=1,
         config=DistributedMapConfig(),
     )
@@ -1001,7 +1199,7 @@ def test_success_destination_include_input_and_owner():
     options = _start_options(
         _new_op_state_calls(),
         source=["a"],
-        processor=DistributedMapProcessor.batch("p"),
+        processor=DistributedMapProcessor.report_batch_outcome("p"),
         max_concurrency=1,
         config=DistributedMapConfig(
             destination=DistributedMapDestination(
@@ -1024,7 +1222,7 @@ def test_failure_destination_error_only_and_owner():
     options = _start_options(
         _new_op_state_calls(),
         source=["a"],
-        processor=DistributedMapProcessor.batch("p"),
+        processor=DistributedMapProcessor.report_batch_outcome("p"),
         max_concurrency=1,
         config=DistributedMapConfig(
             destination=DistributedMapDestination(
@@ -1053,13 +1251,18 @@ def test_operation_to_dict_round_trip_preserves_results():
         name="test_map_run",
         status=OperationStatus.SUCCEEDED,
         distributed_map_details=DistributedMapDetails(
-            completion_reason=DistributedMapCompletionReason.ALL_COMPLETED,
+            source_exhausted=True,
             success_count=1,
             failure_count=1,
             unprocessed_count=0,
             total_count=2,
             distributed_map_run_arn="arn:aws:lambda:us-east-1:123456789012:function:fn:$LATEST/durable-execution/exec1/invoke1/distributed-map-run/z",
-            completion_details="done",
+            error=ErrorObject(
+                message="tolerated",
+                type="DistributedMapFailure",
+                data=None,
+                stack_trace=None,
+            ),
             results=(
                 DistributedMapResultItemApi(
                     item_id="0", status=DistributedMapItemStatus.SUCCEEDED, output=5
@@ -1077,11 +1280,14 @@ def test_operation_to_dict_round_trip_preserves_results():
     block = op.to_dict()["DistributedMapDetails"]
     assert block["Results"][0] == {"ItemId": "0", "Status": "SUCCEEDED", "Output": 5}
     assert block["DistributedMapRunArn"].endswith("/distributed-map-run/z")
-    assert block["CompletionDetails"] == "done"
+    assert block["SourceExhausted"] is True
+    assert block["Error"]["ErrorType"] == "DistributedMapFailure"
     assert block["TotalCount"] == 2
 
     parsed = Operation.from_dict(op.to_dict())
     assert parsed.distributed_map_details is not None
+    assert parsed.distributed_map_details.source_exhausted is True
+    assert parsed.distributed_map_details.error.message == "tolerated"
     assert parsed.distributed_map_details.results[0].output == 5
     assert parsed.distributed_map_details.results[1].error.type == "E"
 
@@ -1090,7 +1296,7 @@ def test_options_full_round_trip():
     options_dict = _start_options(
         _new_op_state_calls(),
         source=DistributedMapSource.s3_csv("s3://b/f.csv", headers=["a"]),
-        processor=DistributedMapProcessor.item_results(
+        processor=DistributedMapProcessor.report_item_outcomes(
             "proc",
             batch_size=5,
             max_retry_attempts=DistributedMapProcessor.UNLIMITED,
@@ -1111,7 +1317,7 @@ def test_options_full_round_trip():
     assert parsed.max_concurrency == 3
     assert parsed.source.source_type is DistributedMapSourceType.S3
     assert parsed.processor.function_response_types == [
-        DistributedMapFunctionResponseType.REPORT_BATCH_ITEM_RESULTS
+        DistributedMapFunctionResponseType.REPORT_BATCH_ITEM_OUTCOMES
     ]
     assert parsed.processor.max_retry_attempts == -1
     assert parsed.processor.durable_execution_name_prefix == "pfx"
@@ -1130,11 +1336,11 @@ def test_csv_first_row_no_headers():
     options = _start_options(
         _new_op_state_calls(),
         source=DistributedMapSource.s3_csv("s3://b/f.csv"),
-        processor=DistributedMapProcessor.batch("p"),
+        processor=DistributedMapProcessor.report_batch_outcome("p"),
         max_concurrency=1,
         config=DistributedMapConfig(),
     )
-    csv_opts = options["Source"]["S3SourceConfig"]["CsvFormatOptions"]
+    csv_opts = options["Source"]["S3SourceConfig"]["ObjectConfig"]["CsvFormatOptions"]
     assert csv_opts["HeaderLocation"] == "FIRST_ROW"
     assert "Headers" not in csv_opts
     assert csv_opts["Delimiter"] == "COMMA"
@@ -1146,7 +1352,7 @@ def test_s3_source_expected_bucket_owner():
         source=DistributedMapSource.s3_json_lines(
             "s3://b/k.jsonl", expected_bucket_owner="123456789012"
         ),
-        processor=DistributedMapProcessor.batch("p"),
+        processor=DistributedMapProcessor.report_batch_outcome("p"),
         max_concurrency=1,
         config=DistributedMapConfig(),
     )
@@ -1157,7 +1363,7 @@ def test_empty_destination_config_omitted():
     options = _start_options(
         _new_op_state_calls(),
         source=["a"],
-        processor=DistributedMapProcessor.batch("p"),
+        processor=DistributedMapProcessor.report_batch_outcome("p"),
         max_concurrency=1,
         config=DistributedMapConfig(destination=DistributedMapDestination()),
     )
@@ -1168,7 +1374,7 @@ def test_success_destination_input_only():
     options = _start_options(
         _new_op_state_calls(),
         source=["a"],
-        processor=DistributedMapProcessor.batch("p"),
+        processor=DistributedMapProcessor.report_batch_outcome("p"),
         max_concurrency=1,
         config=DistributedMapConfig(
             destination=DistributedMapDestination(
@@ -1185,7 +1391,7 @@ def test_failure_destination_input_only():
     options = _start_options(
         _new_op_state_calls(),
         source=["a"],
-        processor=DistributedMapProcessor.batch("p"),
+        processor=DistributedMapProcessor.report_batch_outcome("p"),
         max_concurrency=1,
         config=DistributedMapConfig(
             destination=DistributedMapDestination(
@@ -1204,7 +1410,7 @@ def test_reader_source_options_round_trip():
         source=DistributedMapSource.reader_function(
             "reader", initial_state={"page": 0}
         ),
-        processor=DistributedMapProcessor.batch("p"),
+        processor=DistributedMapProcessor.report_batch_outcome("p"),
         max_concurrency=1,
         config=DistributedMapConfig(),
     )
@@ -1222,7 +1428,7 @@ def test_operation_to_dict_minimal_details_omits_optionals():
         name="test_map_run",
         status=OperationStatus.SUCCEEDED,
         distributed_map_details=DistributedMapDetails(
-            completion_reason=DistributedMapCompletionReason.ALL_COMPLETED,
+            source_exhausted=True,
             success_count=1,
             failure_count=0,
             unprocessed_count=0,
@@ -1282,7 +1488,7 @@ def test_terminal_failure_with_details_resolves_with_summary(status, expected):
         name="test_map_run",
         status=status,
         distributed_map_details=DistributedMapDetails(
-            completion_reason=DistributedMapCompletionReason.FAILURE_TOLERANCE_EXCEEDED,
+            source_exhausted=False,
             success_count=1,
             failure_count=2,
             unprocessed_count=0,
@@ -1305,8 +1511,8 @@ def test_terminal_failure_with_details_resolves_with_summary(status, expected):
         summary.throw_if_error()
 
 
-def test_terminal_without_completion_reason_raises():
-    """A terminal operation missing its completion reason is surfaced, not papered over."""
+def test_terminal_without_source_exhausted_raises():
+    """A terminal operation whose run exists but omits SourceExhausted is surfaced, not papered over."""
     mock_state = Mock(spec=ExecutionState)
     mock_state.durable_execution_arn = "test_arn"
     operation = Operation(
@@ -1316,6 +1522,7 @@ def test_terminal_without_completion_reason_raises():
         name="test_map_run",
         status=OperationStatus.STOPPED,
         distributed_map_details=DistributedMapDetails(
+            distributed_map_run_arn="arn:aws:lambda:us-east-1:123456789012:function:fn:$LATEST/durable-execution/exec1/invoke1/distributed-map-run/abc",
             success_count=0,
             failure_count=0,
             unprocessed_count=3,
@@ -1324,7 +1531,7 @@ def test_terminal_without_completion_reason_raises():
     mock_state.get_checkpoint_result.return_value = (
         CheckpointedResult.create_from_operation(operation)
     )
-    with pytest.raises(ExecutionError, match="carried no CompletionReason"):
+    with pytest.raises(ExecutionError, match="carried no SourceExhausted"):
         distributed_map_handler(
             source=["a"],
             processor="p",
@@ -1358,7 +1565,7 @@ def test_custom_result_serdes_applied_on_decode():
         name="test_map_run",
         status=OperationStatus.SUCCEEDED,
         distributed_map_details=DistributedMapDetails(
-            completion_reason=DistributedMapCompletionReason.ALL_COMPLETED,
+            source_exhausted=True,
             success_count=1,
             failure_count=0,
             unprocessed_count=0,
@@ -1376,7 +1583,7 @@ def test_custom_result_serdes_applied_on_decode():
     )
     result = distributed_map_handler(
         source=["a"],
-        processor=DistributedMapProcessor.item_results("proc"),
+        processor=DistributedMapProcessor.report_item_outcomes("proc"),
         max_concurrency=1,
         state=mock_state,
         operation_identifier=_identifier("cs"),
@@ -1404,7 +1611,7 @@ def test_falsy_output_round_trips(value):
         name="test_map_run",
         status=OperationStatus.SUCCEEDED,
         distributed_map_details=DistributedMapDetails(
-            completion_reason=DistributedMapCompletionReason.ALL_COMPLETED,
+            source_exhausted=True,
             success_count=1,
             failure_count=0,
             unprocessed_count=0,
@@ -1416,7 +1623,7 @@ def test_falsy_output_round_trips(value):
     )
     result = distributed_map_handler(
         source=["a"],
-        processor=DistributedMapProcessor.item_results("proc"),
+        processor=DistributedMapProcessor.report_item_outcomes("proc"),
         max_concurrency=1,
         state=mock_state,
         operation_identifier=_identifier("fo"),
@@ -1430,7 +1637,7 @@ def test_processor_retry_duration_only():
     options = _start_options(
         _new_op_state_calls(),
         source=["a"],
-        processor=DistributedMapProcessor.batch(
+        processor=DistributedMapProcessor.report_batch_outcome(
             "proc",
             max_retry_duration=Duration.from_minutes(5),
         ),
@@ -1451,7 +1658,7 @@ def test_resolved_summary_uses_operation_status_not_details():
         name="test_map_run",
         status=OperationStatus.SUCCEEDED,
         distributed_map_details=DistributedMapDetails(
-            completion_reason=DistributedMapCompletionReason.ALL_COMPLETED,
+            source_exhausted=True,
             success_count=2,
             failure_count=0,
             unprocessed_count=0,
@@ -1460,7 +1667,7 @@ def test_resolved_summary_uses_operation_status_not_details():
     )
     executor = DistributedMapOperationExecutor(
         source=["a", "b"],
-        processor=DistributedMapProcessor.batch("proc"),
+        processor=DistributedMapProcessor.report_batch_outcome("proc"),
         max_concurrency=1,
         state=Mock(spec=ExecutionState),
         operation_identifier=_identifier("dmap-id"),
@@ -1470,7 +1677,7 @@ def test_resolved_summary_uses_operation_status_not_details():
     summary = executor._resolve_summary(operation)
 
     assert summary.status is DistributedMapStatus.SUCCEEDED
-    assert summary.completion_reason is DistributedMapCompletionReason.ALL_COMPLETED
+    assert summary.source_exhausted is True
     assert summary.success_count == 2
 
 
@@ -1485,7 +1692,7 @@ def test_checkpoint_from_a_different_map_is_rejected():
         name="a_different_map",
         status=OperationStatus.SUCCEEDED,
         distributed_map_details=DistributedMapDetails(
-            completion_reason=DistributedMapCompletionReason.ALL_COMPLETED,
+            source_exhausted=True,
             success_count=999,
             failure_count=0,
             unprocessed_count=0,
@@ -1499,7 +1706,7 @@ def test_checkpoint_from_a_different_map_is_rejected():
     with pytest.raises(NonDeterministicExecutionError, match="name checkpoint="):
         distributed_map_handler(
             source=["a", "b"],
-            processor=DistributedMapProcessor.batch("proc"),
+            processor=DistributedMapProcessor.report_batch_outcome("proc"),
             max_concurrency=1,
             state=mock_state,
             operation_identifier=_identifier("dmap-id"),

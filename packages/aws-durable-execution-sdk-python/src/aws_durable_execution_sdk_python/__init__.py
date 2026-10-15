@@ -16,7 +16,6 @@ from aws_durable_execution_sdk_python.config import (
     CompletionItemStatus,
     CompletionOutcome,
     CompletionStatus,
-    DistributedMapCompletionReason,
     DistributedMapItemStatus,
     DistributedMapStatus,
     ParallelBranch,
@@ -39,7 +38,6 @@ from aws_durable_execution_sdk_python.dmap.handlers import (
     durable_distributed_map_item_handler,
 )
 from aws_durable_execution_sdk_python.dmap.models import (
-    DistributedMapItemError,
     DistributedMapResult,
     DistributedMapResultItem,
     DistributedMapSummary,
@@ -87,9 +85,7 @@ __all__ = [
     "CompletionItemStatus",
     "CompletionOutcome",
     "CompletionStatus",
-    "DistributedMapCompletionReason",
     "DistributedMapError",
-    "DistributedMapItemError",
     "DistributedMapItemStatus",
     "DistributedMapResult",
     "DistributedMapResultItem",

@@ -147,7 +147,7 @@ def test_map_run_suspends_then_resumes_with_summary():
     def handler(event, context: DurableContext) -> dict[str, Any]:
         summary = context.distributed_map(
             ["a", "b"],
-            DistributedMapProcessor.batch("proc"),
+            DistributedMapProcessor.report_batch_outcome("proc"),
             max_concurrency=2,
         )
         return {
@@ -164,7 +164,7 @@ def test_map_run_suspends_then_resumes_with_summary():
     # Replay with the run completed.
     _map_run_id, replay_event = _replay_event(
         {
-            "CompletionReason": "ALL_COMPLETED",
+            "SourceExhausted": True,
             "SuccessCount": 2,
             "FailureCount": 0,
             "UnprocessedCount": 0,
@@ -188,19 +188,21 @@ def test_map_run_result_config_returns_items():
     def handler(event, context: DurableContext) -> dict[str, Any]:
         result = context.distributed_map(
             ["a", "b"],
-            DistributedMapProcessor.item_results("proc"),
+            DistributedMapProcessor.report_item_outcomes("proc"),
             max_concurrency=2,
             config=DistributedMapResultConfig(),
         )
         assert isinstance(result, DistributedMapResult)
         return {
             "results": result.get_results(),
-            "errors": [e.error_message for e in result.get_errors()],
+            "errors": [
+                e.message if e is not None else None for e in result.get_errors()
+            ],
         }
 
     _map_run_id, replay_event = _replay_event(
         {
-            "CompletionReason": "ALL_COMPLETED",
+            "SourceExhausted": True,
             "SuccessCount": 1,
             "FailureCount": 1,
             "UnprocessedCount": 0,
@@ -226,7 +228,7 @@ def test_map_run_throw_if_error_fails_execution():
     def handler(event, context: DurableContext) -> dict[str, Any]:
         summary = context.distributed_map(
             ["a"],
-            DistributedMapProcessor.batch("proc"),
+            DistributedMapProcessor.report_batch_outcome("proc"),
             max_concurrency=1,
         )
         summary.throw_if_error()
@@ -234,7 +236,11 @@ def test_map_run_throw_if_error_fails_execution():
 
     _map_run_id, replay_event = _replay_event(
         {
-            "CompletionReason": "FAILURE_TOLERANCE_EXCEEDED",
+            "SourceExhausted": False,
+            "Error": {
+                "ErrorType": "DistributedMapFailure",
+                "ErrorMessage": "failure tolerance exceeded",
+            },
             "SuccessCount": 0,
             "FailureCount": 1,
             "UnprocessedCount": 0,

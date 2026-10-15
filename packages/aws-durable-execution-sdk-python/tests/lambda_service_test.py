@@ -7,9 +7,11 @@ from unittest.mock import Mock, patch
 import pytest
 
 from aws_durable_execution_sdk_python.__about__ import __version__
+from aws_durable_execution_sdk_python.config import DistributedMapItemStatus
 from aws_durable_execution_sdk_python.exceptions import (
     CheckpointError,
     DurableOperationError,
+    ExecutionError,
     GetExecutionStateError,
     SerDesError,
     StepError,
@@ -1276,7 +1278,7 @@ def test_operation_from_dict_no_options():
 
 
 def test_operation_from_dict_in_flight_distributed_map_details_parsed_without_status():
-    """In-flight DistributedMapDetails (no Status/CompletionReason) parses without raising, leaving both None."""
+    """In-flight DistributedMapDetails (no SourceExhausted) parses without raising."""
     data = {
         "Id": "dmap-id",
         "Type": "DISTRIBUTED_MAP",
@@ -1288,7 +1290,8 @@ def test_operation_from_dict_in_flight_distributed_map_details_parsed_without_st
     }
     operation = Operation.from_dict(data)
     assert operation.distributed_map_details is not None
-    assert operation.distributed_map_details.completion_reason is None
+    assert operation.distributed_map_details.source_exhausted is None
+    assert operation.distributed_map_details.error is None
     assert operation.distributed_map_details.total_count == 3
     assert operation.distributed_map_details.success_count == 1
 
@@ -1300,14 +1303,14 @@ def test_operation_from_dict_terminal_distributed_map_details_parsed():
         "Type": "DISTRIBUTED_MAP",
         "Status": "SUCCEEDED",
         "DistributedMapDetails": {
-            "CompletionReason": "ALL_COMPLETED",
+            "SourceExhausted": True,
             "TotalCount": 3,
             "SuccessCount": 3,
         },
     }
     operation = Operation.from_dict(data)
     assert operation.distributed_map_details is not None
-    assert operation.distributed_map_details.completion_reason.value == "ALL_COMPLETED"
+    assert operation.distributed_map_details.source_exhausted is True
 
 
 def test_operation_from_dict_individual_options():
@@ -3078,7 +3081,7 @@ def test_operation_to_dict_omits_absent_context_error_and_replay_children():
 def test_map_run_details_from_dict_parses_results():
     data = {
         "Status": "SUCCEEDED",
-        "CompletionReason": "ALL_COMPLETED",
+        "SourceExhausted": True,
         "SuccessCount": 1,
         "FailureCount": 1,
         "UnprocessedCount": 0,
@@ -3095,17 +3098,38 @@ def test_map_run_details_from_dict_parses_results():
     }
     details = DistributedMapDetails.from_dict(data)
     assert details.total_count == 2
+    assert details.source_exhausted is True
     assert details.results is not None
     assert details.results[0].item_id == "0"
     assert details.results[1].error is not None
     assert details.results[1].error.type == "E"
 
 
-def test_details_missing_completion_reason_parses_with_none():
-    # In-flight runs omit CompletionReason too; parsing must succeed with None.
+def test_details_missing_source_exhausted_parses_with_none():
+    # In-flight runs omit SourceExhausted, so parsing must succeed with None.
     details = DistributedMapDetails.from_dict({"SuccessCount": 2})
-    assert details.completion_reason is None
+    assert details.source_exhausted is None
     assert details.success_count == 2
+
+
+def test_details_parses_the_run_level_error():
+    """The run-level Error parses into the shared ErrorObject with every member."""
+    details = DistributedMapDetails.from_dict(
+        {
+            "SourceExhausted": False,
+            "Error": {
+                "ErrorType": "SourceFailure",
+                "ErrorMessage": "boom",
+                "ErrorData": "d",
+                "StackTrace": ["line"],
+            },
+        }
+    )
+    assert details.error is not None
+    assert details.error.type == "SourceFailure"
+    assert details.error.message == "boom"
+    assert details.error.data == "d"
+    assert details.error.stack_trace == ["line"]
 
 
 def test_result_item_wire_round_trip():
@@ -3125,3 +3149,34 @@ def test_result_item_wire_round_trip():
     dumped = failed.to_dict()
     assert dumped["Error"]["ErrorType"] == "E"
     assert "Output" not in dumped
+
+
+def test_result_item_unknown_status_maps_to_unknown_to_sdk_version():
+    """A status added after this SDK version parses, and the other items are kept."""
+    details = DistributedMapDetails.from_dict(
+        {
+            "SourceExhausted": True,
+            "Results": [
+                {"ItemId": "0", "Status": "SUCCEEDED", "Output": "1"},
+                {"ItemId": "1", "Status": "PARTIALLY_SUCCEEDED"},
+                {
+                    "ItemId": "2",
+                    "Status": "FAILED",
+                    "Error": {"ErrorType": "E", "ErrorMessage": "boom"},
+                },
+            ],
+        }
+    )
+
+    assert details.results is not None
+    assert [item.status for item in details.results] == [
+        DistributedMapItemStatus.SUCCEEDED,
+        DistributedMapItemStatus.UNKNOWN_TO_SDK_VERSION,
+        DistributedMapItemStatus.FAILED,
+    ]
+
+
+def test_result_item_missing_status_raises():
+    """Status is required, so its absence breaks the contract."""
+    with pytest.raises(ExecutionError, match="carried no item status"):
+        DistributedMapResultItem.from_dict({"ItemId": "0", "Output": "1"})
